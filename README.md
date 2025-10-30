@@ -1,6 +1,32 @@
 # webtext
 在cloudflare上创建一个简单workers网页，用来编辑存储简单文本信息，方便查看。可以设置密码。
 
+## 一份 可直接部署到 Cloudflare Workers 的完整代码（模块化 Worker 脚本 + 内嵌静态 HTML/JS/CSS）：
+
+-打开网页需要输入密码（前端提交密码 -> Worker 用 SHA-256 比较哈希值）；
+
+-环境变量 PASSWORD 用于设置密码（可以是明文或已经是 SHA-256 hex）；脚本会把它处理成哈希后用于校验；
+
+-网页标题为 信息查看；
+
+-有 编辑 和 保存 两个按钮；编辑模式会自动保存（KV 存储），保存按钮会把当前文本保存并回到浏览模式；
+
+-使用 Workers KV（请在 dashboard 里把 KV 绑定到变量 CONTENT_KV，文中亦说明）。
+
+**说明：脚本用到的绑定/环境变量
+
+-CONTENT_KV —— 绑定到你的 Workers KV namespace（必须在 Worker 的设置里添加 binding，名称必须一致或你修改代码相应名称）。
+
+-PASSWORD —— 在 Worker 的环境变量（或 Secrets）里设置，用于校验密码。可以直接填明文密码，也可以填 SHA-256 hex（64 字符 0-9a-f）。
+
+-（可选）SESSION_TTL_SECONDS —— session 有效期秒数，默认 24h（86400）。
+
+-（可选）COOKIE_NAME —— session cookie 名称，默认 wksess.
+
+### 把仓库中_workers.js的代码直接放到你的 Worker 脚本里（模块 worker）并部署即可。
+
+
+
 1.部署与绑定步骤（快速参考）
 
 2.在 Cloudflare Dashboard -> Workers -> Create Worker，选择模块化脚本（或直接在你的 repo 用 Wrangler）。
