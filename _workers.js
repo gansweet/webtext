@@ -265,7 +265,7 @@ function renderHTML(authed) {
         <button id="saveBtn" class="primary" disabled>保存</button>
         <button id="logoutBtn" style="margin-left:auto">退出登录</button>
       </div>
-      <div class="small">编辑时会自动保存。点击“保存”结束编辑并保存为浏览模式。</div>
+      <div class="small">编辑时会3min自动保存。点击“保存”结束编辑并保存为浏览模式。</div>
     </div>
   </div>
 
@@ -342,51 +342,57 @@ function renderHTML(authed) {
   } 
   */
   function enterEdit() {
-  if (mode === 'edit') return;
-  mode = 'edit';
-  // 替换显示区域为 textarea
-  const cur = viewArea.textContent;
-  textareaEl = document.createElement('textarea');
-  textareaEl.value = cur === '（当前没有内容）' ? '' : cur;
-  viewArea.replaceWith(textareaEl);
-  saveBtn.disabled = false;
-  editBtn.disabled = true;
-  textareaEl.focus();
-
-  // 进入编辑模式后启动定时自动保存（每 3 分钟一次）
-  if (autoSaveTimer) clearInterval(autoSaveTimer);
-  autoSaveTimer = setInterval(async () => {
-    if (!dirty || saving) return; // 没改动就不保存
-    const v = textareaEl.value;
-    await putContent(v);
-  }, 180000); // 3 分钟自动保存（180000 毫秒）
-
-  // 用户输入时标记为已修改
-  textareaEl.addEventListener('input', () => {
-    dirty = true;
-  });
- }
-
+    if (mode === 'edit') return;
+    mode = 'edit';
   
-  async function exitEdit(save=true) {
+    // ✅ 每次都重新获取当前 viewArea（防止旧引用）
+    const currentView = document.getElementById('viewArea');
+    const cur = currentView ? currentView.textContent : '';
+    
+    textareaEl = document.createElement('textarea');
+    textareaEl.value = cur === '（当前没有内容）' ? '' : cur;
+    currentView.replaceWith(textareaEl);
+  
+    saveBtn.disabled = false;
+    editBtn.disabled = true;
+    textareaEl.focus();
+  
+    // 启动自动保存（3 分钟一次）
+    if (autoSaveTimer) clearInterval(autoSaveTimer);
+    autoSaveTimer = setInterval(async () => {
+      if (!dirty || saving) return;
+      const v = textareaEl.value;
+      await putContent(v);
+    }, 180000);
+  
+    textareaEl.addEventListener('input', () => {
+      dirty = true;
+    });
+  }
+  
+  
+  async function exitEdit(save = true) {
     if (mode !== 'edit') return;
     if (autoSaveTimer) clearInterval(autoSaveTimer);
+  
     const content = textareaEl.value;
     if (save) {
       await putContent(content);
     }
-    // replace textarea with viewArea div
+  
     const newView = document.createElement('div');
     newView.id = 'viewArea';
     newView.style.whiteSpace = 'pre-wrap';
     newView.style.lineHeight = '1.6';
     newView.textContent = content || '（当前没有内容）';
+  
     textareaEl.replaceWith(newView);
     textareaEl = null;
     mode = 'view';
     saveBtn.disabled = true;
     editBtn.disabled = false;
   }
+  
 
   // wire buttons
   editBtn.addEventListener('click', enterEdit);
