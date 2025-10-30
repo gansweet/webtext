@@ -317,7 +317,8 @@ function renderHTML(authed) {
     viewArea.textContent = content || '（当前没有内容）';
   }
 
-  function enterEdit() {
+   /*
+   function enterEdit() {
     if (mode === 'edit') return;
     mode = 'edit';
     // replace viewArea with textarea
@@ -338,8 +339,35 @@ function renderHTML(authed) {
         await putContent(v);
       }, 1500); // 1.5s debounce auto-save
     });
-  }
+  } 
+  */
+  function enterEdit() {
+  if (mode === 'edit') return;
+  mode = 'edit';
+  // 替换显示区域为 textarea
+  const cur = viewArea.textContent;
+  textareaEl = document.createElement('textarea');
+  textareaEl.value = cur === '（当前没有内容）' ? '' : cur;
+  viewArea.replaceWith(textareaEl);
+  saveBtn.disabled = false;
+  editBtn.disabled = true;
+  textareaEl.focus();
 
+  // 进入编辑模式后启动定时自动保存（每 3 分钟一次）
+  if (autoSaveTimer) clearInterval(autoSaveTimer);
+  autoSaveTimer = setInterval(async () => {
+    if (!dirty || saving) return; // 没改动就不保存
+    const v = textareaEl.value;
+    await putContent(v);
+  }, 180000); // 3 分钟自动保存（180000 毫秒）
+
+  // 用户输入时标记为已修改
+  textareaEl.addEventListener('input', () => {
+    dirty = true;
+  });
+ }
+
+  
   async function exitEdit(save=true) {
     if (mode !== 'edit') return;
     if (autoSaveTimer) clearTimeout(autoSaveTimer);
