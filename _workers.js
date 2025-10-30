@@ -370,7 +370,7 @@ function renderHTML(authed) {
   
   async function exitEdit(save=true) {
     if (mode !== 'edit') return;
-    if (autoSaveTimer) clearTimeout(autoSaveTimer);
+    if (autoSaveTimer) clearInterval(autoSaveTimer);
     const content = textareaEl.value;
     if (save) {
       await putContent(content);
