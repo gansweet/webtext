@@ -26,7 +26,10 @@ id = "xxxxxxxxxxxxxxxxxxxx"
 
 6.部署并访问 Worker 的 URL。首次访问会出现登录框，登录成功后可以查看/编辑内容并自动保存到 KV。
 
+## 说明与安全注意
 
+-密码比较使用 SHA-256：前端发送明文密码到 Worker（HTTPS），Worker 在服务端做 SHA-256 比较。若你想提高安全性可以改为前端先做 hash（但若仍发送 hash 也相当于密码），或升级到更复杂的认证方式（例如 OAuth / Cloudflare Access）。
 
+-Session 使用 HMAC-SHA256 签名的 token 存在 cookie（HttpOnly & Secure），有效期可由 SESSION_TTL_SECONDS 配置（默认 86400 秒）。
 
-
+-KV key 为 'document'，你可以改成其它 key 名称。
