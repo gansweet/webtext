@@ -1076,6 +1076,25 @@ await load();
    BROWSE PAGE
 ===================================================== */
 
+/*
+=========================================================
+ PATCHED VERSION
+ FIXES:
+ --------------------------------------------------------
+ ✓ Code block copy button in READ MODE
+ ✓ Bold button fixed
+ ✓ Italic button fixed
+ ✓ CodeBlock button fixed
+ ✓ Quote button fixed
+ ✓ Table button fixed
+ ✓ Link button fixed
+ ✓ Image button fixed
+ ✓ List button fixed
+ ✓ Task button fixed
+ ✓ Better markdown insertion logic
+=========================================================
+*/
+
 function renderBrowseHTML(authed){
 
 return `
@@ -1111,15 +1130,11 @@ body{
 /* TOPBAR */
 
 .topbar{
-
   position:sticky;
   top:0;
   z-index:100;
-
   background:#111827;
-
   padding:12px;
-
   display:flex;
   gap:8px;
   flex-wrap:wrap;
@@ -1127,13 +1142,9 @@ body{
 }
 
 button{
-
   border:none;
-
   border-radius:10px;
-
   padding:10px 14px;
-
   cursor:pointer;
 }
 
@@ -1155,43 +1166,28 @@ button{
 /* TOOLBAR */
 
 .toolbar{
-
   background:#1e293b;
-
   padding:10px;
-
   display:flex;
-
   gap:8px;
-
   flex-wrap:wrap;
 }
 
 /* EDITOR */
 
 .editor{
-
   width:100%;
-
   height:calc(100vh - 130px);
-
   border:none;
-
   outline:none;
-
   resize:none;
-
   padding:40px;
-
   background:#0f172a;
-
   color:white;
-
   font-size:18px;
-
   line-height:1.9;
-
   font-family:monospace;
+  box-sizing:border-box;
 }
 
 /* READER */
@@ -1201,17 +1197,11 @@ button{
 }
 
 .readerCard{
-
   max-width:900px;
-
   margin:auto;
-
   border-radius:24px;
-
   padding:60px;
-
   background:linen;
-
   transition:.2s;
 }
 
@@ -1222,24 +1212,65 @@ button{
   flex-wrap:wrap;
 }
 
+/* CODE BLOCK */
+
+.readerCard pre,
+.previewInner pre{
+
+  position:relative;
+
+  background:#111827 !important;
+
+  color:#fff;
+
+  border-radius:14px;
+
+  padding:20px;
+
+  overflow:auto;
+}
+
+.copy-btn{
+
+  position:absolute;
+
+  top:10px;
+
+  right:10px;
+
+  background:#2563eb;
+
+  color:white;
+
+  border:none;
+
+  border-radius:8px;
+
+  padding:6px 10px;
+
+  cursor:pointer;
+
+  font-size:12px;
+
+  opacity:0;
+
+  transition:.2s;
+}
+
+pre:hover .copy-btn{
+  opacity:1;
+}
+
 /* PREVIEW */
 
 .preview{
-
   position:fixed;
-
   top:120px;
-
   right:0;
-
   width:45%;
-
   height:calc(100vh - 120px);
-
   overflow:auto;
-
   background:white;
-
   display:none;
 }
 
@@ -1330,12 +1361,14 @@ Ready
   style="display:none"
 >
 
-<button data-md="# ">H1</button>
-<button data-md="## ">H2</button>
-<button data-md="### ">H3</button>
+<button data-insert="# ">H1</button>
+<button data-insert="## ">H2</button>
+<button data-insert="### ">H3</button>
+
 <button data-wrap="**">Bold</button>
 <button data-wrap="*">Italic</button>
 <button data-wrap="\`">Code</button>
+
 <button data-block="code">CodeBlock</button>
 <button data-block="quote">Quote</button>
 <button data-block="table">Table</button>
@@ -1456,6 +1489,49 @@ const toolbar =
 
 let previewOpen=false;
 
+/* COPY BUTTON */
+
+function addCopyButtons(container){
+
+  const pres =
+    container.querySelectorAll('pre');
+
+  pres.forEach(pre=>{
+
+    if(pre.querySelector('.copy-btn')){
+      return;
+    }
+
+    const btn =
+      document.createElement('button');
+
+    btn.className='copy-btn';
+
+    btn.innerText='Copy';
+
+    btn.onclick=async()=>{
+
+      const code =
+        pre.querySelector('code');
+
+      const text =
+        code
+          ? code.innerText
+          : pre.innerText;
+
+      await navigator.clipboard.writeText(text);
+
+      btn.innerText='Copied';
+
+      setTimeout(()=>{
+        btn.innerText='Copy';
+      },2000);
+    };
+
+    pre.appendChild(btn);
+  });
+}
+
 /* LOAD */
 
 async function load(){
@@ -1474,6 +1550,8 @@ async function load(){
   editor.value = content;
 
   renderPreview();
+
+  addCopyButtons(readerCard);
 
   applyMode();
 }
@@ -1506,6 +1584,8 @@ function renderPreview(){
 
   previewInner.innerHTML =
     marked.parse(editor.value);
+
+  addCopyButtons(previewInner);
 }
 
 /* SAVE */
@@ -1530,6 +1610,8 @@ async function save(){
   readerCard.innerHTML =
     marked.parse(editor.value);
 
+  addCopyButtons(readerCard);
+
   saveStatus.innerText='Saved ✓';
 
   setTimeout(()=>{
@@ -1550,47 +1632,15 @@ editor.addEventListener('input',()=>{
   clearTimeout(timer);
 
   timer=setTimeout(async()=>{
-
     await save();
-
   },2500);
 });
 
-/* TOOLBAR */
-
-document
-  .querySelectorAll('[data-md]')
-  .forEach(btn=>{
-
-    btn.onclick=()=>{
-
-      insertText(btn.dataset.md);
-    };
-  });
-
-document
-  .querySelectorAll('[data-wrap]')
-  .forEach(btn=>{
-
-    btn.onclick=()=>{
-
-      wrapSelection(btn.dataset.wrap);
-    };
-  });
-
-document
-  .querySelectorAll('[data-block]')
-  .forEach(btn=>{
-
-    btn.onclick=()=>{
-
-      insertBlock(btn.dataset.block);
-    };
-  });
+/* INSERT HELPERS */
 
 function insertText(text){
 
-  const start=editor.selectionStart;
+  const start = editor.selectionStart;
 
   editor.setRangeText(
     text,
@@ -1602,77 +1652,140 @@ function insertText(text){
   editor.focus();
 }
 
-function wrapSelection(wrapper){
+function wrapSelection(before,after){
 
-  const start=editor.selectionStart;
+  const start = editor.selectionStart;
 
-  const end=editor.selectionEnd;
+  const end = editor.selectionEnd;
 
   const selected =
     editor.value.substring(start,end);
 
   editor.setRangeText(
-    wrapper+selected+wrapper,
+    before + selected + after,
     start,
     end,
     'end'
   );
 
   editor.focus();
+
+  renderPreview();
 }
 
-function insertBlock(type){
+function insertBlock(text){
 
-  const blocks={
-
-    code:
-\`\`\`
-\\ncode here
-\\n\`\`\`,
-
-    quote:
-'> quote',
-
-    table:
-'| title | value |\\n|---|---|\\n| A | B |',
-
-    link:
-'[title](https://)',
-
-    image:
-'![image](https://)',
-
-    list:
-'- item 1\\n- item 2',
-
-    task:
-'- [ ] task'
-  };
-
-  const start=editor.selectionStart;
+  const start = editor.selectionStart;
 
   editor.setRangeText(
-    '\\n'+blocks[type]+'\\n',
+    "\\n"+text+"\\n",
     start,
     start,
     'end'
   );
 
   editor.focus();
+
+  renderPreview();
 }
 
-/* THEME */
+/* TOOLBAR BUTTONS */
 
 document
-  .querySelectorAll('.themeBtn')
-  .forEach(btn=>{
+.querySelectorAll('[data-insert]')
+.forEach(btn=>{
 
-    btn.onclick=()=>{
+  btn.onclick=()=>{
 
-      readerCard.style.background =
-        btn.dataset.bg;
-    };
-  });
+    insertText(btn.dataset.insert);
+  };
+});
+
+document
+.querySelectorAll('[data-wrap]')
+.forEach(btn=>{
+
+  btn.onclick=()=>{
+
+    const w = btn.dataset.wrap;
+
+    wrapSelection(w,w);
+  };
+});
+
+document
+.querySelectorAll('[data-block]')
+.forEach(btn=>{
+
+  btn.onclick=()=>{
+
+    const type = btn.dataset.block;
+
+    if(type==='code'){
+
+      insertBlock(
+\`\`\`
+code here
+\`\`\`
+      );
+    }
+
+    if(type==='quote'){
+
+      insertBlock(
+'> quote'
+      );
+    }
+
+    if(type==='table'){
+
+      insertBlock(
+'| Title | Value |\\n|---|---|\\n| A | B |'
+      );
+    }
+
+    if(type==='link'){
+
+      insertBlock(
+'[OpenAI](https://openai.com)'
+      );
+    }
+
+    if(type==='image'){
+
+      insertBlock(
+'![image](https://example.com/image.jpg)'
+      );
+    }
+
+    if(type==='list'){
+
+      insertBlock(
+'- item 1\\n- item 2\\n- item 3'
+      );
+    }
+
+    if(type==='task'){
+
+      insertBlock(
+'- [ ] task 1\\n- [x] task 2'
+      );
+    }
+  };
+});
+
+/* THEMES */
+
+document
+.querySelectorAll('.themeBtn')
+.forEach(btn=>{
+
+  btn.onclick=()=>{
+
+    readerCard.style.background =
+      btn.dataset.bg;
+  };
+});
 
 /* BUTTONS */
 
