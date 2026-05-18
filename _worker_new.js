@@ -1724,16 +1724,14 @@ document
     if(type==='code'){
 
       insertBlock(
-\`\`\`
-code here
-\`\`\`
+'\`\`\`  '
       );
     }
 
     if(type==='quote'){
 
       insertBlock(
-'> quote'
+'>  '
       );
     }
 
