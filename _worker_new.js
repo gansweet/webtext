@@ -1367,7 +1367,7 @@ Ready
 
 <button data-wrap="**">Bold</button>
 <button data-wrap="*">Italic</button>
-<button data-wrap="\`">Code</button>
+<button data-wrap="  \`\`">Code</button>
 
 <button data-block="code">CodeBlock</button>
 <button data-block="quote">Quote</button>
@@ -1724,7 +1724,7 @@ document
     if(type==='code'){
 
       insertBlock(
-'\`\`\`  '
+'\`\`\`  \\n\\n\\n\`\`\`'
       );
     }
 
