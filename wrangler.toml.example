@@ -1,0 +1,9 @@
+name = "amos-note-workspace"
+main = "_workers_webtext.js"
+compatibility_date = "2026-10-20"
+
+# Copy this file to wrangler.toml, then replace the placeholder with
+# the ID of the EXISTING namespace that already contains your notes.
+[[kv_namespaces]]
+binding = "CONTENT_KV"
+id = "REPLACE_WITH_EXISTING_KV_NAMESPACE_ID"
