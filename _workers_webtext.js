@@ -1,1877 +1,319 @@
 /*
-=========================================================
- ADVANCED MARKDOWN WORKSPACE
- Cloudflare Worker - Enhanced Edition
-
- NEW IMPROVEMENTS
- --------------------------------------------------------
- ✓ Full Markdown toolbar
- ✓ Insert markdown buttons
- ✓ Better writing workspace
- ✓ Reading themes
- ✓ Linen reading background
- ✓ Live save indicator
- ✓ Better editor layout
- ✓ Better reading UI
- ✓ Markdown shortcuts
- ✓ Responsive mobile/iPad/desktop
- ✓ Preview mode
- ✓ Autosave
- ✓ Word count
- ✓ Reading time
- ✓ Copy code blocks
- ✓ Search
- ✓ Rename/Delete/Reorder docs
- ✓ Render Math/LaTeX Formulas (KaTeX)
-
- REQUIRED:
- --------------------------------------------------------
- KV Binding:
- CONTENT_KV
-
- ENV:
- PASSWORD
- SECRET
- SESSION_TTL_SECONDS
-=========================================================
-*/
+ * AMOS Note Workspace — Cloudflare Worker
+ * Compatible KV schema (unchanged):
+ *   titles            -> JSON string array of document titles
+ *   doc:<encodedTitle> -> raw text / Markdown body
+ * Keep these keys and formats unchanged to preserve existing data.
+ */
 
 const COOKIE_NAME = 'wksess';
 
 export default {
   async fetch(request, env) {
-    return handleRequest(request, env);
+    try {
+      return await handleRequest(request, env);
+    } catch (error) {
+      console.error('Request failed:', error);
+      return json({ ok: false, error: 'Internal server error' }, 500);
+    }
   },
 };
 
-/* =====================================================
-   UTILS
-===================================================== */
-
-async function sha256Hex(text){
-
-  const enc = new TextEncoder();
-
-  const data = enc.encode(text);
-
-  const hash = await crypto.subtle.digest(
-    'SHA-256',
-    data
-  );
-
-  return Array.from(new Uint8Array(hash))
-    .map(b=>b.toString(16).padStart(2,'0'))
-    .join('');
+async function sha256Hex(text) {
+  const data = new TextEncoder().encode(text);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function base64UrlEncode(bytes){
-
-  const b64 = btoa(
-    String.fromCharCode(...new Uint8Array(bytes))
-  );
-
-  return b64
-    .replace(/\+/g,'-')
-    .replace(/\//g,'_')
-    .replace(/=+$/,'');
+function base64UrlEncode(bytes) {
+  return btoa(String.fromCharCode(...new Uint8Array(bytes)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
-function base64UrlDecodeToUint8Array(str){
-
-  str = str.replace(/-/g,'+')
-           .replace(/_/g,'/');
-
-  while(str.length % 4){
-    str += '=';
-  }
-
+function base64UrlDecodeToUint8Array(str) {
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (str.length % 4) str += '=';
   const bin = atob(str);
-
   const arr = new Uint8Array(bin.length);
-
-  for(let i=0;i<bin.length;i++){
-    arr[i]=bin.charCodeAt(i);
-  }
-
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
   return arr;
 }
 
-async function hmacSha256Sign(keyStr,dataStr){
-
-  const enc = new TextEncoder();
-
-  const key = await crypto.subtle.importKey(
-    'raw',
-    enc.encode(keyStr),
-    {name:'HMAC',hash:'SHA-256'},
-    false,
-    ['sign']
-  );
-
-  const sig = await crypto.subtle.sign(
-    'HMAC',
-    key,
-    enc.encode(dataStr)
-  );
-
-  return new Uint8Array(sig);
+async function hmacSha256Sign(keyStr, dataStr) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(keyStr), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(dataStr)));
 }
 
-async function verifyHmac(keyStr,dataStr,sigBytes){
-
-  const enc = new TextEncoder();
-
-  const key = await crypto.subtle.importKey(
-    'raw',
-    enc.encode(keyStr),
-    {name:'HMAC',hash:'SHA-256'},
-    false,
-    ['verify']
-  );
-
-  return crypto.subtle.verify(
-    'HMAC',
-    key,
-    sigBytes,
-    enc.encode(dataStr)
-  );
+async function verifyHmac(keyStr, dataStr, sigBytes) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(keyStr), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+  return crypto.subtle.verify('HMAC', key, sigBytes, new TextEncoder().encode(dataStr));
 }
 
-/* =====================================================
-   SESSION
-===================================================== */
-
-async function makeSessionToken(secret,ttlSeconds=86400){
-
-  const header = base64UrlEncode(
-    new TextEncoder().encode(
-      JSON.stringify({
-        alg:'HS256',
-        typ:'WKS'
-      })
-    )
-  );
-
-  const payload = base64UrlEncode(
-    new TextEncoder().encode(
-      JSON.stringify({
-        exp:
-          Math.floor(Date.now()/1000)
-          + ttlSeconds
-      })
-    )
-  );
-
-  const toSign = header+'.'+payload;
-
-  const sig = await hmacSha256Sign(
-    secret,
-    toSign
-  );
-
-  return toSign+'.'+base64UrlEncode(sig);
+async function makeSessionToken(secret, ttlSeconds = 86400) {
+  const header = base64UrlEncode(new TextEncoder().encode(JSON.stringify({ alg: 'HS256', typ: 'WKS' })));
+  const payload = base64UrlEncode(new TextEncoder().encode(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + ttlSeconds })));
+  const toSign = header + '.' + payload;
+  return toSign + '.' + base64UrlEncode(await hmacSha256Sign(secret, toSign));
 }
 
-async function verifySessionToken(token,secret){
-
-  try{
-
+async function verifySessionToken(token, secret) {
+  try {
     const parts = token.split('.');
-
-    if(parts.length!==3){
-      return false;
-    }
-
-    const [header,payload,sig] = parts;
-
-    const ok = await verifyHmac(
-      secret,
-      header+'.'+payload,
-      base64UrlDecodeToUint8Array(sig)
-    );
-
-    if(!ok)return false;
-
-    const payloadObj = JSON.parse(
-      new TextDecoder().decode(
-        base64UrlDecodeToUint8Array(payload)
-      )
-    );
-
-    return payloadObj.exp >
-      Math.floor(Date.now()/1000);
-
-  }catch{
+    if (parts.length !== 3) return false;
+    const [header, payload, sig] = parts;
+    if (!await verifyHmac(secret, header + '.' + payload, base64UrlDecodeToUint8Array(sig))) return false;
+    const payloadObj = JSON.parse(new TextDecoder().decode(base64UrlDecodeToUint8Array(payload)));
+    return payloadObj.exp > Math.floor(Date.now() / 1000);
+  } catch {
     return false;
   }
 }
 
-/* =====================================================
-   COOKIES
-===================================================== */
-
-function parseCookies(cookieHeader){
-
-  const out={};
-
-  if(!cookieHeader)return out;
-
-  for(const part of cookieHeader.split(';')){
-
-    const [k,v]=part.split('=');
-
-    if(k&&v){
-      out[k.trim()] = decodeURIComponent(v.trim());
+function parseCookies(cookieHeader) {
+  const out = {};
+  if (!cookieHeader) return out;
+  for (const part of cookieHeader.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 0) continue;
+    const key = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (key) {
+      try { out[key] = decodeURIComponent(value); } catch { out[key] = value; }
     }
   }
-
   return out;
 }
 
-function makeSetCookieHeader(name,value,options={}){
-
-  let s =
-    `${name}=${encodeURIComponent(value)}`;
-
-  if(options.maxAge!=null){
-    s += `; Max-Age=${options.maxAge}`;
-  }
-
+function makeSetCookieHeader(name, value, options = {}) {
+  let s = name + '=' + encodeURIComponent(value);
+  if (options.maxAge != null) s += '; Max-Age=' + options.maxAge;
   s += '; Path=/';
-
-  if(options.httpOnly){
-    s += '; HttpOnly';
-  }
-
-  if(options.secure){
-    s += '; Secure';
-  }
-
-  if(options.sameSite){
-    s += `; SameSite=${options.sameSite}`;
-  }
-
+  if (options.httpOnly) s += '; HttpOnly';
+  if (options.secure) s += '; Secure';
+  if (options.sameSite) s += '; SameSite=' + options.sameSite;
   return s;
 }
 
-/* =====================================================
-   REQUEST HANDLER
-===================================================== */
-
-async function handleRequest(request,env){
-
+async function handleRequest(request, env) {
   const url = new URL(request.url);
-
   const pathname = url.pathname;
-
-  const providedPasswordEnv =
-    env.PASSWORD || '';
-
-  const storedHash =
-    /^[0-9a-f]{64}$/i.test(
-      providedPasswordEnv.trim()
-    )
-      ? providedPasswordEnv.trim().toLowerCase()
-      : await sha256Hex(providedPasswordEnv);
-
-  const secret =
-    env.SECRET ||
-    storedHash ||
-    'dev-secret';
-
-  const cookies = parseCookies(
-    request.headers.get('Cookie') || ''
-  );
-
+  const providedPasswordEnv = env.PASSWORD || '';
+  const storedHash = /^[0-9a-f]{64}$/i.test(providedPasswordEnv.trim())
+    ? providedPasswordEnv.trim().toLowerCase()
+    : await sha256Hex(providedPasswordEnv);
+  const secret = env.SECRET || storedHash || 'dev-secret';
+  const cookies = parseCookies(request.headers.get('Cookie') || '');
   const token = cookies[COOKIE_NAME];
+  const authed = token ? await verifySessionToken(token, secret) : false;
 
-  const authed = token
-    ? await verifySessionToken(token,secret)
-    : false;
-
-  if(pathname==='/' && request.method==='GET'){
-
-    return new Response(
-      renderMainHTML(authed),
-      {
-        headers:{
-          'Content-Type':'text/html;charset=utf-8'
-        }
-      }
-    );
+  if (pathname === '/' && request.method === 'GET') {
+    return new Response(renderMainHTML(authed), { headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'no-store' } });
+  }
+  if (pathname === '/browse' && request.method === 'GET') {
+    return new Response(renderBrowseHTML(authed), { headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'no-store' } });
+  }
+  if (pathname === '/login' && request.method === 'POST') {
+    let body;
+    try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid request' }, 400); }
+    if (!body || body.hash !== storedHash) return json({ ok: false, error: 'Wrong password' }, 401);
+    const ttl = Math.max(60, Math.min(parseInt(env.SESSION_TTL_SECONDS, 10) || 86400, 2592000));
+    const tk = await makeSessionToken(secret, ttl);
+    const cookie = makeSetCookieHeader(COOKIE_NAME, tk, { httpOnly: true, secure: true, sameSite: 'Lax', maxAge: ttl });
+    return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store', 'Set-Cookie': cookie } });
+  }
+  if (pathname === '/logout') {
+    return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json;charset=utf-8', 'Set-Cookie': makeSetCookieHeader(COOKIE_NAME, '', { maxAge: 0, httpOnly: true, secure: true, sameSite: 'Lax' }), 'Cache-Control': 'no-store' } });
   }
 
-  if(pathname==='/browse'
-    && request.method==='GET'
-  ){
-
-    return new Response(
-      renderBrowseHTML(authed),
-      {
-        headers:{
-          'Content-Type':'text/html;charset=utf-8'
-        }
-      }
-    );
+  // Keep the original API routes, KV keys and serialized value formats.
+  if (pathname === '/api/titles' && request.method === 'GET') {
+    if (!authed) return json({ ok: false, error: 'unauthorized' }, 401);
+    const raw = await env.CONTENT_KV.get('titles', { type: 'json' });
+    return json({ ok: true, titles: Array.isArray(raw) ? raw : [] });
   }
-
-  if(pathname==='/login'
-    && request.method==='POST'
-  ){
-
-    const body = await request.json();
-
-    if(body.hash!==storedHash){
-
-      return json({
-        ok:false,
-        error:'Wrong password'
-      },401);
-    }
-
-    const ttl =
-      parseInt(env.SESSION_TTL_SECONDS)
-      || 86400;
-
-    const tk = await makeSessionToken(
-      secret,
-      ttl
-    );
-
-    const cookie = makeSetCookieHeader(
-      COOKIE_NAME,
-      tk,
-      {
-        httpOnly:true,
-        secure:true,
-        sameSite:'Lax',
-        maxAge:ttl
-      }
-    );
-
-    return new Response(
-      JSON.stringify({ok:true}),
-      {
-        headers:{
-          'Content-Type':'application/json',
-          'Set-Cookie':cookie
-        }
-      }
-    );
+  if (pathname === '/api/titles' && request.method === 'PUT') {
+    if (!authed) return json({ ok: false, error: 'unauthorized' }, 401);
+    let body;
+    try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid request' }, 400); }
+    const titles = Array.isArray(body.titles) ? body.titles.filter(t => typeof t === 'string') : [];
+    await env.CONTENT_KV.put('titles', JSON.stringify(titles));
+    return json({ ok: true });
   }
-
-  if(pathname==='/logout'){
-
-    const cookie = makeSetCookieHeader(
-      COOKIE_NAME,
-      '',
-      {maxAge:0}
-    );
-
-    return new Response(
-      JSON.stringify({ok:true}),
-      {
-        headers:{
-          'Content-Type':'application/json',
-          'Set-Cookie':cookie
-        }
-      }
-    );
+  if (pathname.startsWith('/api/doc/') && request.method === 'GET') {
+    if (!authed) return json({ ok: false, error: 'unauthorized' }, 401);
+    let title;
+    try { title = decodeURIComponent(pathname.slice('/api/doc/'.length)); } catch { return json({ ok: false, error: 'Invalid document title' }, 400); }
+    const val = await env.CONTENT_KV.get('doc:' + encodeURIComponent(title), { type: 'text' });
+    return json({ ok: true, content: val || '' });
   }
-
-  if(pathname==='/api/titles'
-    && request.method==='GET'
-  ){
-
-    const raw =
-      await env.CONTENT_KV.get(
-        'titles',
-        {type:'json'}
-      );
-
-    return json({
-      ok:true,
-      titles:raw||[]
-    });
+  if (pathname.startsWith('/api/doc/') && request.method === 'PUT') {
+    if (!authed) return json({ ok: false, error: 'unauthorized' }, 401);
+    let title;
+    let body;
+    try { title = decodeURIComponent(pathname.slice('/api/doc/'.length)); body = await request.json(); } catch { return json({ ok: false, error: 'Invalid request' }, 400); }
+    await env.CONTENT_KV.put('doc:' + encodeURIComponent(title), typeof body.content === 'string' ? body.content : '');
+    return json({ ok: true });
   }
-
-  if(pathname==='/api/titles'
-    && request.method==='PUT'
-  ){
-
-    if(!authed){
-
-      return json({
-        ok:false,
-        error:'unauthorized'
-      },401);
-    }
-
-    const body = await request.json();
-
-    await env.CONTENT_KV.put(
-      'titles',
-      JSON.stringify(body.titles||[])
-    );
-
-    return json({ok:true});
+  if (pathname === '/api/title/delete' && request.method === 'POST') {
+    if (!authed) return json({ ok: false, error: 'unauthorized' }, 401);
+    let body;
+    try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid request' }, 400); }
+    const title = body.title;
+    const raw = await env.CONTENT_KV.get('titles', { type: 'json' }) || [];
+    await env.CONTENT_KV.put('titles', JSON.stringify(raw.filter(t => t !== title)));
+    await env.CONTENT_KV.delete('doc:' + encodeURIComponent(title));
+    return json({ ok: true });
   }
-
-  if(pathname.startsWith('/api/doc/')
-    && request.method==='GET'
-  ){
-
-    const title = decodeURIComponent(
-      pathname.slice('/api/doc/'.length)
-    );
-
-    const val =
-      await env.CONTENT_KV.get(
-        'doc:'+encodeURIComponent(title),
-        {type:'text'}
-      );
-
-    return json({
-      ok:true,
-      content:val||''
-    });
+  if (pathname === '/api/title/rename' && request.method === 'POST') {
+    if (!authed) return json({ ok: false, error: 'unauthorized' }, 401);
+    let body;
+    try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid request' }, 400); }
+    const { oldTitle, newTitle: rawNewTitle } = body;
+    const newTitle = typeof rawNewTitle === 'string' ? rawNewTitle.trim() : '';
+    if (!oldTitle || !newTitle) return json({ ok: false, error: 'Title cannot be empty' }, 400);
+    const raw = await env.CONTENT_KV.get('titles', { type: 'json' }) || [];
+    if (raw.includes(newTitle) && newTitle !== oldTitle) return json({ ok: false, error: 'Title exists' }, 400);
+    if (!raw.includes(oldTitle)) return json({ ok: false, error: 'Document not found' }, 404);
+    if (newTitle === oldTitle) return json({ ok: true });
+    const list = raw.map(t => t === oldTitle ? newTitle : t);
+    const content = await env.CONTENT_KV.get('doc:' + encodeURIComponent(oldTitle), { type: 'text' }) || '';
+    await env.CONTENT_KV.put('titles', JSON.stringify(list));
+    await env.CONTENT_KV.put('doc:' + encodeURIComponent(newTitle), content);
+    await env.CONTENT_KV.delete('doc:' + encodeURIComponent(oldTitle));
+    return json({ ok: true });
   }
-
-  if(pathname.startsWith('/api/doc/')
-    && request.method==='PUT'
-  ){
-
-    if(!authed){
-
-      return json({
-        ok:false,
-        error:'unauthorized'
-      },401);
-    }
-
-    const title = decodeURIComponent(
-      pathname.slice('/api/doc/'.length)
-    );
-
-    const body = await request.json();
-
-    await env.CONTENT_KV.put(
-      'doc:'+encodeURIComponent(title),
-      body.content||''
-    );
-
-    return json({ok:true});
-  }
-
-  if(pathname==='/api/title/delete'
-    && request.method==='POST'
-  ){
-
-    if(!authed){
-
-      return json({
-        ok:false,
-        error:'unauthorized'
-      },401);
-    }
-
-    const {title}=await request.json();
-
-    const raw =
-      await env.CONTENT_KV.get(
-        'titles',
-        {type:'json'}
-      ) || [];
-
-    const list =
-      raw.filter(t=>t!==title);
-
-    await env.CONTENT_KV.put(
-      'titles',
-      JSON.stringify(list)
-    );
-
-    await env.CONTENT_KV.delete(
-      'doc:'+encodeURIComponent(title)
-    );
-
-    return json({ok:true});
-  }
-
-  if(pathname==='/api/title/rename'
-    && request.method==='POST'
-  ){
-
-    if(!authed){
-
-      return json({
-        ok:false,
-        error:'unauthorized'
-      },401);
-    }
-
-    const {
-      oldTitle,
-      newTitle
-    } = await request.json();
-
-    const raw =
-      await env.CONTENT_KV.get(
-        'titles',
-        {type:'json'}
-      ) || [];
-
-    if(raw.includes(newTitle)){
-
-      return json({
-        ok:false,
-        error:'Title exists'
-      },400);
-    }
-
-    const list = raw.map(t=>
-      t===oldTitle
-        ? newTitle
-        : t
-    );
-
-    const content =
-      await env.CONTENT_KV.get(
-        'doc:'+encodeURIComponent(oldTitle),
-        {type:'text'}
-      ) || '';
-
-    await env.CONTENT_KV.put(
-      'titles',
-      JSON.stringify(list)
-    );
-
-    await env.CONTENT_KV.put(
-      'doc:'+encodeURIComponent(newTitle),
-      content
-    );
-
-    await env.CONTENT_KV.delete(
-      'doc:'+encodeURIComponent(oldTitle)
-    );
-
-    return json({ok:true});
-  }
-
-  return new Response(
-    'Not Found',
-    {status:404}
-  );
+  return new Response('Not Found', { status: 404 });
 }
 
-function json(obj,status=200){
-
-  return new Response(
-    JSON.stringify(obj),
-    {
-      status,
-      headers:{
-        'Content-Type':'application/json'
-      }
-    }
-  );
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store' } });
 }
 
-/* =====================================================
-   MAIN PAGE
-===================================================== */
+function logoMarkup(extraClass = '') {
+  return '<svg class="amosLogo ' + extraClass + '" viewBox="0 0 72 72" role="img" aria-label="Amos logo" xmlns="http://www.w3.org/2000/svg">' +
+    '<defs><linearGradient id="amosGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8be9ff"/><stop offset=".55" stop-color="#51b7ff"/><stop offset="1" stop-color="#a78bfa"/></linearGradient><linearGradient id="amosRing" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f8fdff"/><stop offset="1" stop-color="#64cfff"/></linearGradient></defs>' +
+    '<rect x="3" y="3" width="66" height="66" rx="23" fill="#0d203b" stroke="#ffffff" stroke-opacity=".18"/>' +
+    '<path d="M18 48 32.5 17.5a3.8 3.8 0 0 1 7 0L54 48h-9l-9-20-9 20z" fill="url(#amosGrad)"/>' +
+    '<path d="M12 43c8-10 17-14 26-12 7 1 13 5 21 0" fill="none" stroke="url(#amosRing)" stroke-width="2.6" stroke-linecap="round" opacity=".92"/>' +
+    '<circle cx="57" cy="26" r="4" fill="#fff"/><circle cx="57" cy="26" r="7" fill="none" stroke="#77d9ff" stroke-opacity=".48"/>' +
+    '</svg>';
+}
 
-function renderMainHTML(authed){
-
-return `
-<!doctype html>
-<html>
-<head>
-
-<meta charset="utf-8"/>
-
-<meta
-  name="viewport"
-  content="width=device-width,initial-scale=1"
-/>
-
-<title>Note Workspace</title>
-
+function renderMainHTML(authed) {
+  const favicon = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='20' fill='%230d203b'/%3E%3Cpath d='M12 45 28 13a4 4 0 0 1 8 0l16 32h-10L32 24 22 45z' fill='%2377d9ff'/%3E%3Ccircle cx='51' cy='21' r='4' fill='white'/%3E%3C/svg%3E";
+  return String.raw`<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#081426"><meta name="description" content="Amos Note Workspace — a calm home for your thoughts.">
+<link rel="icon" type="image/svg+xml" href="${favicon}"><title>Amos · Note Workspace</title>
 <style>
-
-body{
-  margin:0;
-  font-family:system-ui;
-  background:#0f172a;
-  color:white;
-}
-
-.wrap{
-  max-width:1100px;
-  margin:auto;
-  padding:24px;
-}
-
-.card{
-  background:#111827;
-  border-radius:24px;
-  padding:24px;
-}
-
-input{
-  width:100%;
-  padding:14px;
-  border:none;
-  border-radius:14px;
-  background:#1e293b;
-  color:white;
-}
-
-button{
-  border:none;
-  border-radius:12px;
-  padding:12px 16px;
-  cursor:pointer;
-}
-
-.primary{
-  background:#2563eb;
-  color:white;
-}
-
-.secondary{
-  background:#1e293b;
-  color:white;
-}
-
-.danger{
-  background:#dc2626;
-  color:white;
-}
-
-.row{
-  display:flex;
-  gap:12px;
-  flex-wrap:wrap;
-}
-
-.doc{
-  background:#1e293b;
-  border-radius:18px;
-  padding:18px;
-  margin-top:16px;
-
-  display:flex;
-  justify-content:space-between;
-  align-items:center;
-  gap:12px;
-  flex-wrap:wrap;
-}
-
-.actions{
-  display:flex;
-  gap:8px;
-  flex-wrap:wrap;
-}
-
-@media(max-width:700px){
-
-  .doc{
-    flex-direction:column;
-    align-items:stretch;
-  }
-
-  .actions button{
-    flex:1;
-  }
-}
-
-</style>
-</head>
-
-<body>
-
-<div class="wrap">
-
-<div class="card">
-
-<h1> Note Workspace</h1>
-
+:root{color-scheme:dark;--accent:#67d6ff;--accent2:#548eff;--accent-soft:rgba(103,214,255,.15);--rose:#ff8ab3;--ink:#eaf4ff;--muted:#90a5c4;--panel:rgba(11,26,49,.76);--line:rgba(173,210,255,.15)}
+:root[data-theme="rose"]{--accent:#ffa0c2;--accent2:#bd86ff;--accent-soft:rgba(255,160,194,.14)}
+:root[data-theme="mint"]{--accent:#84f3cb;--accent2:#42b9d5;--accent-soft:rgba(132,243,203,.14)}
+:root[data-theme="amber"]{--accent:#ffd18a;--accent2:#ff9b88;--accent-soft:rgba(255,209,138,.14)}
+*{box-sizing:border-box}html{min-height:100%;background:#071326}body{margin:0;min-height:100vh;color:var(--ink);font-family:Inter,"Aptos",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;background:radial-gradient(ellipse at 12% 12%,rgba(54,131,214,.20),transparent 32%),radial-gradient(ellipse at 88% 70%,rgba(130,85,211,.15),transparent 34%),linear-gradient(135deg,#071326,#0b1830 55%,#081425);overflow-x:hidden}
+body:before,body:after{content:"";position:fixed;z-index:0;width:42vw;height:42vw;min-width:280px;min-height:280px;border-radius:50%;filter:blur(60px);opacity:.23;pointer-events:none;animation:drift 18s ease-in-out infinite alternate;background:radial-gradient(circle,var(--accent2),transparent 68%);top:-12%;left:-12%}body:after{width:34vw;height:34vw;top:auto;left:auto;right:-7%;bottom:-15%;animation-delay:-8s;background:radial-gradient(circle,var(--accent),transparent 70%);opacity:.15}@keyframes drift{to{transform:translate(9vw,12vh) scale(1.15)}}
+button,input{font:inherit}button{color:inherit;cursor:pointer;border:1px solid rgba(190,220,255,.14);transition:transform .18s,border-color .18s,box-shadow .18s,background .18s}button:hover{transform:translateY(-2px);border-color:rgba(150,220,255,.44);box-shadow:0 10px 28px rgba(1,7,20,.22)}button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.droplet{padding:11px 18px;border:1px solid rgba(255,255,255,.3);border-radius:46% 54% 42% 58% / 58% 44% 56% 42%;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#061328;font-weight:750;box-shadow:0 8px 24px rgba(54,146,255,.18)}.ghost{padding:10px 15px;border-radius:17px 17px 14px 17px;background:rgba(127,164,213,.10);color:var(--ink)}.danger{background:rgba(255,105,137,.13);color:#ffafc2;border-color:rgba(255,123,154,.24)}.wrap{position:relative;z-index:1;width:min(1180px,100%);margin:0 auto;padding:clamp(16px,4vw,42px)}.shell{border:1px solid var(--line);background:linear-gradient(145deg,rgba(19,39,68,.82),rgba(9,22,42,.81));box-shadow:0 30px 90px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.04);border-radius:30px;backdrop-filter:blur(22px);padding:clamp(20px,3.5vw,42px)}
+.loginWrap{min-height:100vh;display:grid;place-items:center;padding:24px}.loginCard{position:relative;z-index:1;width:min(460px,100%);padding:clamp(28px,6vw,48px);text-align:center;border-radius:34px;border:1px solid rgba(196,226,255,.20);background:linear-gradient(155deg,rgba(19,42,74,.82),rgba(8,20,39,.83));box-shadow:0 34px 100px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.07);backdrop-filter:blur(24px);animation:rise .65s ease-out both}@keyframes rise{from{opacity:0;transform:translateY(18px) scale(.985)}to{opacity:1;transform:none}}.loginLogo{width:78px;height:78px;margin:0 auto 18px;filter:drop-shadow(0 8px 20px rgba(77,181,255,.2))}.amosLogo{display:block;width:56px;height:56px;flex-shrink:0}.loginCard h1,.workspaceTitle{font-family:"Palatino Linotype",Palatino,"Iowan Old Style",Georgia,serif;letter-spacing:.035em}.loginCard h1{font-size:clamp(30px,5vw,40px);margin:4px 0 10px}.eyebrow{color:var(--accent);font-size:11px;font-weight:800;letter-spacing:.24em;text-transform:uppercase}.sub{color:var(--muted);line-height:1.7;font-size:14px}.loginForm{margin-top:30px;display:grid;gap:13px}.field{width:100%;min-width:0;padding:16px 17px;border-radius:18px;border:1px solid rgba(174,207,248,.18);background:rgba(3,12,26,.5);color:#f5faff;outline:none}.field::placeholder{color:#7f94b4}.loginError{min-height:20px;font-size:13px;color:#ffabc1}.loginFoot{margin-top:25px;color:#7287a8;font-size:12px}
+.topline{display:flex;align-items:center;gap:15px;margin-bottom:26px}.brandText{min-width:0}.brandText strong{display:block;font-family:Georgia,serif;font-size:20px;letter-spacing:.06em}.brandText span{display:block;font-size:12px;color:var(--muted);margin-top:3px}.topActions{margin-left:auto}.workspaceTitle{margin:8px 0 4px;text-align:center;font-size:clamp(34px,5vw,48px);font-weight:600;background:linear-gradient(100deg,#f3fbff 10%,var(--accent) 55%,#b7b9ff);-webkit-background-clip:text;background-clip:text;color:transparent}.titleSub{text-align:center;color:var(--muted);margin:0 0 22px;font-size:14px}.skinBar{display:flex;align-items:center;justify-content:center;gap:9px;flex-wrap:wrap;margin:18px 0 32px}.skinLabel{font-size:12px;letter-spacing:.08em;color:#849ab9}.skinBtn{font-size:12px;padding:8px 13px;border-radius:28px;background:rgba(112,155,208,.08);color:#b9cce4}.skinBtn.active{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}.createRow{display:flex;gap:12px;margin-bottom:15px}.createRow .field{flex:1}.searchRow{display:flex;gap:10px;margin:12px 0 16px}.searchRow .field{flex:1}.searchBtn{display:flex;align-items:center;gap:8px;padding-inline:17px;border-radius:18px 18px 15px 18px;background:rgba(77,153,220,.15);color:#c5e9ff;border-color:rgba(104,197,255,.26)}.toolbarLine{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:space-between}.viewSwitch{display:flex;gap:7px}.viewBtn{font-size:12px;border-radius:14px;padding:9px 13px;background:rgba(112,155,208,.08);color:#9fb5d4}.viewBtn.active{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}.resultNote{font-size:12px;color:var(--muted);min-height:20px;margin:8px 0}.docs{display:grid;gap:12px;margin-top:8px}.docs.cards{grid-template-columns:repeat(auto-fill,minmax(min(100%,270px),1fr));gap:15px}.docItem{min-width:0;border:1px solid rgba(172,205,245,.12);background:linear-gradient(135deg,rgba(37,61,94,.58),rgba(15,33,58,.72));border-radius:21px;padding:17px;display:flex;align-items:center;gap:14px;justify-content:space-between;transition:transform .2s,border-color .2s,background .2s}.docItem:hover{border-color:rgba(114,207,255,.34);background:linear-gradient(135deg,rgba(44,81,121,.61),rgba(15,33,58,.82))}.docs.cards .docItem{align-items:flex-start;min-height:184px;flex-direction:column;padding:20px;border-radius:24px;cursor:grab}.docItem.dragging{opacity:.4}.docItem.dropTarget{outline:2px dashed var(--accent);outline-offset:3px}.docMeta{display:flex;align-items:center;gap:13px;min-width:0;flex:1}.docs.cards .docMeta{align-items:flex-start}.docIcon{width:43px;height:43px;display:grid;place-items:center;flex:0 0 43px;font-size:21px;border-radius:16px;background:var(--accent-soft);border:1px solid rgba(124,196,255,.17)}.docName{font-weight:750;overflow-wrap:anywhere;color:#e8f4ff}.docExcerpt{margin-top:7px;max-width:100%;font-size:12px;line-height:1.6;color:#91a9c9;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.docActions{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.docs.cards .docActions{justify-content:flex-start;margin-top:auto}.mini{padding:8px 11px;border-radius:14px;font-size:12px;background:rgba(132,164,208,.11);color:#c2d5ed}.mini.primary{background:var(--accent-soft);color:var(--accent);border-color:rgba(106,203,255,.25)}.mini.delete{color:#ffadc2;background:rgba(255,104,139,.09)}.empty{padding:36px 20px;text-align:center;border:1px dashed rgba(165,198,237,.19);border-radius:22px;color:var(--muted);line-height:1.8}.bottomNote{text-align:center;font-size:11px;color:#7286a6;padding:25px 0 4px}
+@media(max-width:640px){.wrap{padding:12px}.shell{border-radius:24px;padding:19px}.topline{gap:10px}.topActions{margin-left:0}.topline{flex-wrap:wrap}.createRow{flex-wrap:wrap}.createRow .field{flex-basis:100%}.createRow button{flex:1}.searchRow .field{min-width:0}.searchBtn span{display:none}.docItem{align-items:flex-start;flex-direction:column}.docActions{width:100%;justify-content:flex-start}.docs.cards{grid-template-columns:1fr}.loginCard{border-radius:28px}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition:none!important}}
+</style></head><body>
 ${authed ? `
-
-<div class="row">
-
-<input
-  id="newTitleInput"
-  placeholder="Create document..."
-/>
-
-<button
-  class="primary"
-  id="addBtn"
->
-Create
-</button>
-
-<button
-  class="secondary"
-  id="logoutBtn"
->
-Logout
-</button>
-
-</div>
-
-<div style="height:16px"></div>
-
-<input
-  id="searchInput"
-  placeholder="Search documents..."
-/>
-
-<div id="docs"></div>
-
-` : `
-
-<form id="loginForm">
-
-<div class="row">
-
-<input
-  id="pw"
-  type="password"
-  placeholder="Password"
-/>
-
-<button class="primary">
-Login
-</button>
-
-</div>
-
-</form>
-
-`}
-
-</div>
-
-</div>
-
+<main class="wrap"><section class="shell">
+  <header class="topline">${logoMarkup()}<div class="brandText"><strong>AMOS / NOTE STUDIO</strong><span>A personal library for ideas</span></div><div class="topActions"><button id="logoutBtn" class="ghost">↗ Sign out</button></div></header>
+  <h1 class="workspaceTitle">Note Workspace</h1><p class="titleSub">A quiet place to collect, shape and revisit your thoughts.</p>
+  <div class="skinBar" aria-label="Workspace themes"><span class="skinLabel">CHOOSE YOUR MOOD</span><button class="skinBtn active" data-theme-pick="ocean">🌊 Ocean</button><button class="skinBtn" data-theme-pick="rose">🌹 Rose</button><button class="skinBtn" data-theme-pick="mint">🌿 Aurora</button><button class="skinBtn" data-theme-pick="amber">☀️ Amber</button></div>
+  <div class="createRow"><input class="field" id="newTitleInput" maxlength="160" placeholder="Give a new note a name…" aria-label="New document title"><button class="droplet" id="addBtn">＋ Create note</button></div>
+  <div class="searchRow"><input class="field" id="searchInput" placeholder="Search documents and their contents…" aria-label="Search documents"><button class="searchBtn" id="searchBtn" aria-label="Search"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg><span>Search</span></button></div>
+  <div class="toolbarLine"><div class="viewSwitch"><button class="viewBtn active" id="listViewBtn">☷ List view</button><button class="viewBtn" id="cardViewBtn">▦ Card view</button></div><span id="docCount" class="skinLabel"></span></div>
+  <div id="resultNote" class="resultNote" aria-live="polite"></div><div id="docs" class="docs"></div>
+  <div class="bottomNote">AMOS NOTE STUDIO · Your existing Cloudflare KV notes remain in their original format.</div>
+</section></main>` : `
+<main class="loginWrap"><section class="loginCard">${logoMarkup('loginLogo')}<div class="eyebrow">PERSONAL KNOWLEDGE SPACE</div><h1>Welcome to Amos</h1><p class="sub">A little space for big thoughts.<br>Sign in to return to your notes.</p><form class="loginForm" id="loginForm"><input class="field" id="pw" type="password" placeholder="Enter your workspace password" autocomplete="current-password" required><button class="droplet" type="submit" id="loginBtn">Unlock workspace&nbsp; ↗</button><div id="loginError" class="loginError" aria-live="polite"></div></form><div class="loginFoot">PRIVATE BY DESIGN · BUILT FOR YOUR IDEAS</div></section></main>`}
 <script>
-
-(async()=>{
-
-async function sha256Hex(text){
-
-  const enc = new TextEncoder();
-
-  const data = enc.encode(text);
-
-  const hash = await crypto.subtle.digest(
-    'SHA-256',
-    data
-  );
-
-  return Array.from(new Uint8Array(hash))
-    .map(b=>b.toString(16).padStart(2,'0'))
-    .join('');
-}
-
-const authed=${authed?'true':'false'};
-
-if(!authed){
-
-  document
-    .getElementById('loginForm')
-    .addEventListener('submit',async e=>{
-
-      e.preventDefault();
-
-      const pw =
-        document.getElementById('pw').value;
-
-      const hash =
-        await sha256Hex(pw);
-
-      const r = await fetch('/login',{
-        method:'POST',
-        headers:{
-          'Content-Type':'application/json'
-        },
-        body:JSON.stringify({hash})
-      });
-
-      const j = await r.json();
-
-      if(j.ok){
-        location.reload();
-      }else{
-        alert(j.error||'Login failed');
-      }
-    });
-
-  return;
-}
-
-const docs =
-  document.getElementById('docs');
-
-const searchInput =
-  document.getElementById('searchInput');
-
-let titles=[];
-
-async function load(){
-
-  const r = await fetch('/api/titles');
-
-  const j = await r.json();
-
-  titles = j.titles || [];
-
-  render();
-}
-
-function render(){
-
-  docs.innerHTML='';
-
-  const q =
-    searchInput.value.toLowerCase();
-
-  titles
-    .filter(t=>
-      t.toLowerCase().includes(q)
-    )
-    .forEach((t,index)=>{
-
-      const div=document.createElement('div');
-
-      div.className='doc';
-
-      div.innerHTML=\`
-        <div style="font-size:20px;font-weight:700">
-          \${t}
-        </div>
-
-        <div class="actions">
-
-          <button
-            class="secondary"
-            onclick="location.href='/browse?mode=read&title='+encodeURIComponent('\${t}')"
-          >
-            Read
-          </button>
-
-          <button
-            class="primary"
-            onclick="location.href='/browse?mode=edit&title='+encodeURIComponent('\${t}')"
-          >
-            Edit
-          </button>
-
-          <button
-            class="secondary"
-            data-up="\${index}"
-          >
-            ↑
-          </button>
-
-          <button
-            class="secondary"
-            data-down="\${index}"
-          >
-            ↓
-          </button>
-
-          <button
-            class="secondary"
-            data-rename="\${t}"
-          >
-            Rename
-          </button>
-
-          <button
-            class="danger"
-            data-delete="\${t}"
-          >
-            Delete
-          </button>
-
-        </div>
-      \`;
-
-      docs.appendChild(div);
-    });
-
-  bindEvents();
-}
-
-function bindEvents(){
-
-  document
-    .querySelectorAll('[data-delete]')
-    .forEach(btn=>{
-
-      btn.onclick=async()=>{
-
-        const title =
-          btn.dataset.delete;
-
-        if(!confirm('Delete '+title+' ?')){
-          return;
-        }
-
-        await fetch(
-          '/api/title/delete',
-          {
-            method:'POST',
-            headers:{
-              'Content-Type':'application/json'
-            },
-            body:JSON.stringify({title})
-          }
-        );
-
-        await load();
-      };
-    });
-
-  document
-    .querySelectorAll('[data-rename]')
-    .forEach(btn=>{
-
-      btn.onclick=async()=>{
-
-        const oldTitle =
-          btn.dataset.rename;
-
-        const newTitle =
-          prompt('Rename',oldTitle);
-
-        if(!newTitle)return;
-
-        await fetch(
-          '/api/title/rename',
-          {
-            method:'POST',
-            headers:{
-              'Content-Type':'application/json'
-            },
-            body:JSON.stringify({
-              oldTitle,
-              newTitle
-            })
-          }
-        );
-
-        await load();
-      };
-    });
-
-  document
-    .querySelectorAll('[data-up]')
-    .forEach(btn=>{
-
-      btn.onclick=async()=>{
-
-        const i =
-          Number(btn.dataset.up);
-
-        if(i===0)return;
-
-        [titles[i-1],titles[i]] =
-        [titles[i],titles[i-1]];
-
-        await saveOrder();
-      };
-    });
-
-  document
-    .querySelectorAll('[data-down]')
-    .forEach(btn=>{
-
-      btn.onclick=async()=>{
-
-        const i =
-          Number(btn.dataset.down);
-
-        if(i===titles.length-1)return;
-
-        [titles[i+1],titles[i]] =
-        [titles[i],titles[i+1]];
-
-        await saveOrder();
-      };
-    });
-}
-
-async function saveOrder(){
-
-  await fetch('/api/titles',{
-    method:'PUT',
-    headers:{
-      'Content-Type':'application/json'
-    },
-    body:JSON.stringify({titles})
-  });
-
-  render();
-}
-
-searchInput.oninput=render;
-
-document.getElementById('addBtn').onclick=async()=>{
-
-  const val =
-    document.getElementById(
-      'newTitleInput'
-    ).value.trim();
-
-  if(!val)return;
-
-  titles.push(val);
-
-  await saveOrder();
-
-  await fetch(
-    '/api/doc/'+encodeURIComponent(val),
-    {
-      method:'PUT',
-      headers:{
-        'Content-Type':'application/json'
-      },
-      body:JSON.stringify({
-        content:'# '+val
-      })
-    }
-  );
-
-  document.getElementById(
-    'newTitleInput'
-  ).value='';
-
-  await load();
-};
-
-document.getElementById('logoutBtn').onclick=async()=>{
-
-  await fetch('/logout',{
-    method:'POST'
-  });
-
-  location.reload();
-};
-
-await load();
-
+(async function(){
+'use strict';
+async function sha256Hex(text){const data=new TextEncoder().encode(text);const hash=await crypto.subtle.digest('SHA-256',data);return Array.from(new Uint8Array(hash)).map(function(b){return b.toString(16).padStart(2,'0')}).join('')}
+const authed=${authed ? 'true' : 'false'};
+if(!authed){const form=document.getElementById('loginForm');form.addEventListener('submit',async function(e){e.preventDefault();const btn=document.getElementById('loginBtn');const err=document.getElementById('loginError');btn.disabled=true;btn.textContent='Unlocking…';err.textContent='';try{const hash=await sha256Hex(document.getElementById('pw').value);const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hash:hash})});const j=await r.json();if(j.ok){location.reload()}else{err.textContent='Password not recognised. Please try again.';document.getElementById('pw').focus()}}catch(e){err.textContent='Could not connect. Please try again.'}finally{btn.disabled=false;btn.textContent='Unlock workspace ↗'}});return}
+const docsEl=document.getElementById('docs'),searchInput=document.getElementById('searchInput'),resultNote=document.getElementById('resultNote'),docCount=document.getElementById('docCount');let titles=[],view='list',searchMatches=null,searchExcerpts={},dragTitle=null;
+try{view=localStorage.getItem('amos-doc-view')||'list'}catch(e){}
+function pickTheme(theme){if(['ocean','rose','mint','amber'].indexOf(theme)<0)theme='ocean';document.documentElement.setAttribute('data-theme',theme==='ocean'?'':theme);try{localStorage.setItem('amos-theme',theme)}catch(e){}document.querySelectorAll('[data-theme-pick]').forEach(function(b){b.classList.toggle('active',b.dataset.themePick===theme)})}
+try{pickTheme(localStorage.getItem('amos-theme')||'ocean')}catch(e){pickTheme('ocean')}
+document.querySelectorAll('[data-theme-pick]').forEach(function(b){b.addEventListener('click',function(){pickTheme(b.dataset.themePick)})});
+function el(tag,cls,text){const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=text;return n}
+function api(url,opts){return fetch(url,opts||{}).then(async function(r){let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw new Error(j.error||('Request failed: '+r.status));return j})}
+async function load(){try{const j=await api('/api/titles');titles=Array.isArray(j.titles)?j.titles:[];render()}catch(e){resultNote.textContent='Could not load notes: '+e.message}}
+function getVisibleTitles(){const q=searchInput.value.trim().toLocaleLowerCase();return titles.filter(function(t){if(searchMatches)return searchMatches.has(t);return !q||t.toLocaleLowerCase().includes(q)})}
+function addDocItem(title,index,excerpt){const item=el('article','docItem');item.draggable=true;item.dataset.title=title;const meta=el('div','docMeta');const ico=el('div','docIcon',['✦','✎','❖','☼','✧','⌘','❋','◈'][Math.abs(index)%8]);ico.setAttribute('aria-hidden','true');meta.appendChild(ico);const info=el('div','docInfo');info.style.minWidth='0';info.appendChild(el('div','docName',title));if(excerpt)info.appendChild(el('div','docExcerpt',excerpt));meta.appendChild(info);item.appendChild(meta);const actions=el('div','docActions');function act(label,cls,fn){const b=el('button','mini'+(cls?' '+cls:''),label);b.type='button';b.addEventListener('click',fn);actions.appendChild(b)}act('↗ Read','primary',function(){location.href='/browse?mode=read&title='+encodeURIComponent(title)});act('✎ Edit','',function(){location.href='/browse?mode=edit&title='+encodeURIComponent(title)});act('↑','',function(){moveTitle(title,-1)});act('↓','',function(){moveTitle(title,1)});act('Rename','',async function(){const val=prompt('Rename document',title);if(val===null||!val.trim()||val.trim()===title)return;try{await api('/api/title/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({oldTitle:title,newTitle:val.trim()})});await load()}catch(e){alert(e.message)}});act('Delete','delete',async function(){if(!confirm('Delete “'+title+'” and its contents? This cannot be undone.'))return;try{await api('/api/title/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:title})});await load()}catch(e){alert(e.message)}});item.appendChild(actions);
+item.addEventListener('dragstart',function(e){dragTitle=title;item.classList.add('dragging');if(e.dataTransfer){e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',title)}});item.addEventListener('dragend',function(){item.classList.remove('dragging');document.querySelectorAll('.dropTarget').forEach(function(n){n.classList.remove('dropTarget')});dragTitle=null});item.addEventListener('dragover',function(e){e.preventDefault();if(title!==dragTitle)item.classList.add('dropTarget')});item.addEventListener('dragleave',function(){item.classList.remove('dropTarget')});item.addEventListener('drop',async function(e){e.preventDefault();item.classList.remove('dropTarget');const from=dragTitle||(e.dataTransfer&&e.dataTransfer.getData('text/plain'));if(from&&from!==title){const fi=titles.indexOf(from);if(fi>=0&&titles.indexOf(title)>=0){titles.splice(fi,1);const targetIndex=titles.indexOf(title);titles.splice(targetIndex,0,from);await saveOrder()}}});return item}
+function render(){docsEl.textContent='';docsEl.classList.toggle('cards',view==='cards');document.getElementById('listViewBtn').classList.toggle('active',view==='list');document.getElementById('cardViewBtn').classList.toggle('active',view==='cards');const visible=getVisibleTitles();docCount.textContent=visible.length+' / '+titles.length+' NOTES';if(!visible.length){docsEl.appendChild(el('div','empty',titles.length?'No matching notes. Try a different search.':'Your workspace is a blank canvas. Create your first note above.'));return}visible.forEach(function(t){docsEl.appendChild(addDocItem(t,titles.indexOf(t),searchExcerpts[t]||''))})}
+async function saveOrder(){try{await api('/api/titles',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({titles:titles})});searchMatches=null;render()}catch(e){alert('Could not save order: '+e.message);await load()}}
+async function moveTitle(title,delta){const i=titles.indexOf(title),j=i+delta;if(i<0||j<0||j>=titles.length)return;const x=titles[i];titles[i]=titles[j];titles[j]=x;await saveOrder()}
+async function runSearch(){const q=searchInput.value.trim().toLocaleLowerCase();if(!q){searchMatches=null;searchExcerpts={};resultNote.textContent='';render();return}resultNote.textContent='Searching note contents…';searchMatches=new Set();searchExcerpts={};await Promise.all(titles.map(async function(t){if(t.toLocaleLowerCase().includes(q)){searchMatches.add(t);return}try{const j=await api('/api/doc/'+encodeURIComponent(t));const c=(j.content||'');const at=c.toLocaleLowerCase().indexOf(q);if(at>=0){searchMatches.add(t);searchExcerpts[t]='…'+c.slice(Math.max(0,at-55),Math.min(c.length,at+q.length+95)).replace(/\s+/g,' ').trim()+'…'}}catch(e){}}));resultNote.textContent='Search found '+searchMatches.size+' note(s) containing “'+searchInput.value.trim()+'”.';render()}
+searchInput.addEventListener('input',function(){searchMatches=null;searchExcerpts={};resultNote.textContent='';render()});searchInput.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();runSearch()}});document.getElementById('searchBtn').addEventListener('click',runSearch);document.getElementById('listViewBtn').addEventListener('click',function(){view='list';try{localStorage.setItem('amos-doc-view',view)}catch(e){}render()});document.getElementById('cardViewBtn').addEventListener('click',function(){view='cards';try{localStorage.setItem('amos-doc-view',view)}catch(e){}render()});
+document.getElementById('addBtn').addEventListener('click',async function(){const input=document.getElementById('newTitleInput'),val=input.value.trim();if(!val)return;if(titles.indexOf(val)>=0){alert('A note with this title already exists.');return}titles.push(val);try{await api('/api/titles',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({titles:titles})});await api('/api/doc/'+encodeURIComponent(val),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:'# '+val+'\n\n'})});input.value='';searchInput.value='';searchMatches=null;await load()}catch(e){alert('Could not create note: '+e.message)}});document.getElementById('newTitleInput').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();document.getElementById('addBtn').click()}});document.getElementById('logoutBtn').addEventListener('click',async function(){await fetch('/logout',{method:'POST'});location.href='/'});await load();
 })();
-</script>
-
-</body>
-</html>
-`;
+</script></body></html>`;
 }
 
-/* =====================================================
-   BROWSE PAGE
-===================================================== */
-
-/*
-=========================================================
- PATCHED VERSION
- FIXES:
- --------------------------------------------------------
- ✓ Code block copy button in READ MODE
- ✓ Bold button fixed
- ✓ Italic button fixed
- ✓ CodeBlock button fixed
- ✓ Quote button fixed
- ✓ Table button fixed
- ✓ Link button fixed
- ✓ Image button fixed
- ✓ List button fixed
- ✓ Task button fixed
- ✓ Better markdown insertion logic
- ✓ Mathematical formula (KaTeX) rendering support
-=========================================================
-*/
-
-function renderBrowseHTML(authed){
-
-return `
-<!doctype html>
-<html>
-
-<head>
-
-<meta charset="utf-8"/>
-
-<meta
-  name="viewport"
-  content="width=device-width,initial-scale=1"
-/>
-
-<title>Note Markdown Editor</title>
-
-<link
-  rel="stylesheet"
-  href="https://cdn.jsdelivr.net/npm/github-markdown-css/github-markdown.min.css"
-/>
-
-<!-- KaTeX CSS for Math Rendering -->
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" />
-
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-
-<!-- KaTeX JS and Marked Extension for rendering formulas -->
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/marked-katex-extension/lib/index.umd.js"></script>
-
+function renderBrowseHTML(authed) {
+  const favicon = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='20' fill='%230d203b'/%3E%3Cpath d='M12 45 28 13a4 4 0 0 1 8 0l16 32h-10L32 24 22 45z' fill='%2377d9ff'/%3E%3Ccircle cx='51' cy='21' r='4' fill='white'/%3E%3C/svg%3E";
+  return String.raw`<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#081426"><link rel="icon" type="image/svg+xml" href="${favicon}"><title>Amos · Reading Studio</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css/github-markdown.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.css">
+<script src="https://cdn.jsdelivr.net/npm/marked@18.1.1/lib/marked.umd.js"></script><script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.16/dist/purify.min.js"></script><script src="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.js"></script><script src="https://cdn.jsdelivr.net/npm/marked-katex-extension@5.1.13/lib/index.umd.js"></script><script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
 <style>
-
-body{
-  margin:0;
-  font-family:system-ui;
-  background:#0f172a;
-}
-
-/* TOPBAR */
-
-.topbar{
-  position:sticky;
-  top:0;
-  z-index:100;
-  background:#111827;
-  padding:12px;
-  display:flex;
-  gap:8px;
-  flex-wrap:wrap;
-  align-items:center;
-}
-
-button{
-  border:none;
-  border-radius:10px;
-  padding:10px 14px;
-  cursor:pointer;
-}
-
-.primary{
-  background:#2563eb;
-  color:white;
-}
-
-.secondary{
-  background:#1e293b;
-  color:white;
-}
-
-.success{
-  background:#16a34a;
-  color:white;
-}
-
-/* TOOLBAR */
-
-.toolbar{
-  background:#1e293b;
-  padding:10px;
-  display:flex;
-  gap:8px;
-  flex-wrap:wrap;
-}
-
-/* EDITOR */
-
-.editor{
-  width:100%;
-  height:calc(100vh - 130px);
-  border:none;
-  outline:none;
-  resize:none;
-  padding:40px;
-  background:#0f172a;
-  color:white;
-  font-size:18px;
-  line-height:1.9;
-  font-family:monospace;
-  box-sizing:border-box;
-}
-
-/* READER */
-
-.readerWrap{
-  padding:30px;
-}
-
-.readerCard{
-  max-width:900px;
-  margin:auto;
-  border-radius:24px;
-  padding:60px;
-  background:linen;
-  transition:.2s;
-}
-
-.themeButtons{
-  margin-bottom:18px;
-  display:flex;
-  gap:8px;
-  flex-wrap:wrap;
-}
-
-/* CODE BLOCK */
-
-.readerCard pre,
-.previewInner pre{
-
-  position:relative;
-
-  background:#111827 !important;
-
-  color:#fff;
-
-  border-radius:14px;
-
-  padding:20px;
-
-  overflow:auto;
-}
-
-.copy-btn{
-
-  position:absolute;
-
-  top:10px;
-
-  right:10px;
-
-  background:#2563eb;
-
-  color:white;
-
-  border:none;
-
-  border-radius:8px;
-
-  padding:6px 10px;
-
-  cursor:pointer;
-
-  font-size:12px;
-
-  opacity:0;
-
-  transition:.2s;
-}
-
-pre:hover .copy-btn{
-  opacity:1;
-}
-
-/* PREVIEW */
-
-.preview{
-  position:fixed;
-  top:120px;
-  right:0;
-  width:45%;
-  height:calc(100vh - 120px);
-  overflow:auto;
-  background:white;
-  display:none;
-}
-
-.preview.show{
-  display:block;
-}
-
-.previewInner{
-  padding:40px;
-}
-
-.saveStatus{
-  margin-left:auto;
-  color:#94a3b8;
-}
-
-/* MOBILE */
-
-@media(max-width:900px){
-
-  .editor{
-    padding:18px;
-    font-size:16px;
-  }
-
-  .preview{
-    width:100%;
-  }
-
-  .readerWrap{
-    padding:16px;
-  }
-
-  .readerCard{
-    padding:24px;
-  }
-}
-
-</style>
-</head>
-
-<body>
-
+:root{color-scheme:dark;--accent:#78dfff;--accent2:#548eff;--text:#e5efff;--muted:#9bb0d0;--edge:rgba(181,212,255,.16);--ui:rgba(8,22,42,.92)}:root[data-theme="rose"]{--accent:#ffa0c2;--accent2:#bd86ff}:root[data-theme="mint"]{--accent:#84f3cb;--accent2:#42b9d5}:root[data-theme="amber"]{--accent:#ffd18a;--accent2:#ff9b88}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 12% 0%,rgba(54,131,214,.14),transparent 34%),#081426;color:var(--text);font-family:Inter,"Aptos",system-ui,-apple-system,"Segoe UI",sans-serif}button,textarea{font:inherit}button{cursor:pointer;transition:transform .16s,border-color .16s,background .16s}button:hover{transform:translateY(-1px)}button:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.btn{padding:10px 15px;border:1px solid var(--edge);border-radius:18px 18px 14px 18px;background:rgba(115,151,203,.12);color:#dbeaff}.btn.primary{background:linear-gradient(130deg,var(--accent),var(--accent2));color:#07172c;border-color:rgba(255,255,255,.4);font-weight:750}.btn.active{border-color:var(--accent);color:var(--accent);background:rgba(90,190,255,.12)}.btn:disabled{opacity:.5;cursor:wait}.pageHead{width:min(1480px,100%);margin:auto;padding:15px clamp(14px,3vw,38px);display:flex;align-items:center;gap:13px;border-bottom:1px solid rgba(177,211,255,.10)}.amosLogo{width:44px;height:44px;flex-shrink:0}.brand{min-width:0}.brand strong{display:block;font-family:Georgia,serif;font-size:16px;letter-spacing:.06em}.brand span{display:block;color:var(--muted);font-size:12px;margin-top:2px}.headTitle{margin-left:auto;color:#9fb6d7;font-size:12px;max-width:42%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.status{font-size:12px;color:var(--muted);min-width:80px;text-align:right}.main{width:min(1480px,100%);margin:0 auto;padding:clamp(12px,2.3vw,30px)}.readerWrap{--paper:#f3eee4;--paperText:#282c34;--paperMuted:#606b79;--paperLink:#1b69a8;--paperCode:#17253b;padding:10px 0 80px}.readerCard{width:min(1200px,100%);min-height:68vh;margin:0 auto;padding:clamp(24px,5.3vw,82px);border-radius:30px;background:var(--paper);color:var(--paperText);box-shadow:0 30px 90px rgba(0,0,0,.22);transition:max-width .2s,background .2s,color .2s}.readerCard[data-skin="white"]{--paper:#fff;--paperText:#242a32;--paperMuted:#67707b;--paperLink:#145da0}.readerCard[data-skin="warm"]{--paper:#f4ecd8;--paperText:#383125;--paperMuted:#7c705e;--paperLink:#885323}.readerCard[data-skin="gray"]{--paper:#e7e9ed;--paperText:#292f39;--paperMuted:#606975;--paperLink:#225e9a}.readerCard[data-skin="midnight"]{--paper:#172233;--paperText:#e5edf8;--paperMuted:#9facbf;--paperLink:#7bc8ff;--paperCode:#0b1422}.readerCard[data-skin="sage"]{--paper:#eaf0e6;--paperText:#26382f;--paperMuted:#5d7063;--paperLink:#276d54}.readerCard[data-width="compact"]{max-width:840px}.readerCard[data-width="comfort"]{max-width:1080px}.readerCard[data-width="wide"]{max-width:1380px}.readerCard[data-font="serif"]{font-family:Georgia,"Iowan Old Style",serif}.readerCard[data-font="sans"]{font-family:Inter,system-ui,sans-serif}.readerCard[data-fontsize="small"]{font-size:16px}.readerCard[data-fontsize="medium"]{font-size:18px}.readerCard[data-fontsize="large"]{font-size:20px}.readerCard.markdown-body{font-size:inherit;color:var(--paperText);background:var(--paper);line-height:1.85;overflow-wrap:anywhere}.readerCard.markdown-body h1,.readerCard.markdown-body h2,.readerCard.markdown-body h3{color:var(--paperText);font-family:Georgia,"Iowan Old Style",serif;line-height:1.3;letter-spacing:-.025em}.readerCard.markdown-body h1{font-size:2.35em;border-bottom-color:color-mix(in srgb,var(--paperText) 15%,transparent)}.readerCard.markdown-body h2{margin-top:1.65em;border-bottom-color:color-mix(in srgb,var(--paperText) 12%,transparent)}.readerCard.markdown-body a{color:var(--paperLink)}.readerCard.markdown-body blockquote{color:var(--paperMuted);border-left:4px solid var(--accent2)}.readerCard.markdown-body hr{border-color:color-mix(in srgb,var(--paperText) 14%,transparent)}.readerCard.markdown-body table tr{background:transparent;border-top-color:color-mix(in srgb,var(--paperText) 12%,transparent)}.readerCard.markdown-body table tr:nth-child(2n){background:color-mix(in srgb,var(--paperText) 5%,transparent)}.readerCard.markdown-body td,.readerCard.markdown-body th{border-color:color-mix(in srgb,var(--paperText) 14%,transparent)}.readerCard pre,.previewInner pre{position:relative;overflow:auto;padding:22px 20px 18px;border-radius:16px;background:var(--paperCode)!important;color:#eff6ff!important;line-height:1.65}.readerCard pre code,.previewInner pre code{color:inherit}.copy-btn{position:absolute;top:8px;right:8px;padding:5px 9px;border:1px solid rgba(190,220,255,.2);border-radius:9px;background:#27456b;color:#f5fbff;font-size:11px;opacity:0;transition:opacity .16s}.readerCard pre:hover .copy-btn,.previewInner pre:hover .copy-btn,.copy-btn:focus-visible{opacity:1}.readerCard img{max-width:100%;height:auto;border-radius:13px}.readerCard iframe{max-width:100%}.readerCard .mermaid{overflow:auto;background:rgba(120,140,160,.06);padding:18px;border-radius:15px}.readerCard .mermaid svg{max-width:100%;height:auto}.readerCard .katex-display{overflow-x:auto;overflow-y:hidden;padding:8px 0}.readerCard .raw-html-note{border-left:3px solid var(--accent2);padding:12px 16px;background:rgba(100,170,220,.08)}
+.fabTrigger{position:fixed;z-index:90;right:22px;bottom:22px;width:60px;height:60px;border:1px solid rgba(255,255,255,.38);border-radius:43% 57% 54% 46% / 48% 42% 58% 52%;background:linear-gradient(140deg,var(--accent),var(--accent2));color:#07172c;font-size:22px;font-weight:800;box-shadow:0 12px 38px rgba(0,0,0,.34)}.fabPanel{position:fixed;z-index:89;right:22px;bottom:92px;width:min(335px,calc(100vw - 28px));padding:17px;border:1px solid rgba(180,214,255,.22);border-radius:23px;background:rgba(8,22,42,.96);box-shadow:0 22px 70px rgba(0,0,0,.45);backdrop-filter:blur(20px);display:none;max-height:calc(100vh - 125px);overflow:auto}.fabPanel.open{display:block;animation:pop .18s ease-out}@keyframes pop{from{opacity:0;transform:translateY(7px) scale(.98)}to{opacity:1;transform:none}}.fabPanel h3{margin:2px 0 10px;font-size:12px;letter-spacing:.12em;color:#8fa8c9;text-transform:uppercase}.fabActions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.settingGroup{border-top:1px solid rgba(186,216,255,.12);padding-top:14px;margin-top:14px}.optionRow{display:flex;flex-wrap:wrap;gap:7px}.optionRow .btn{font-size:12px;padding:8px 10px}.workspaceNav{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:0 auto 18px;width:min(1200px,100%)}.workspaceNav .btn{font-size:12px}.readHeading{width:min(1200px,100%);margin:0 auto 16px;padding:0 3px;color:#c2d4ed;font-size:12px}.readHeading strong{color:#edf6ff;font-size:18px;margin-right:8px}.editShell{width:min(1480px,100%);margin:0 auto;display:none}.editToolbar{display:flex;gap:7px;flex-wrap:wrap;padding:12px;margin-bottom:12px;border:1px solid var(--edge);border-radius:18px;background:rgba(14,32,58,.72)}.editToolbar .btn{padding:8px 11px;font-size:12px}.detectBar{display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:10px 0 12px}.detectHint{color:var(--muted);font-size:12px;flex:1}.editArea{position:relative;min-height:62vh;border:1px solid rgba(168,208,255,.18);border-radius:20px;overflow:hidden;background:#0b192e;box-shadow:0 18px 45px rgba(0,0,0,.16)}.editorUnderlay{position:absolute;z-index:0;inset:0;margin:0;padding:0;overflow:hidden;pointer-events:none;white-space:pre;color:transparent;font:16px/1.72 ui-monospace,SFMono-Regular,Consolas,monospace;tab-size:2}.underlayInner{position:absolute;left:28px;top:27px;will-change:transform}.underlayLine{display:block;width:max-content;min-width:100%;height:1.72em;line-height:1.72;box-sizing:border-box}.underlayLine.issue{background:rgba(255,183,77,.20);box-shadow:inset 3px 0 #ffbd62}.editor{position:relative;z-index:1;display:block;width:100%;height:62vh;min-height:480px;resize:vertical;border:0;outline:0;padding:27px 28px;background:transparent;color:#e6f1ff;caret-color:#8ce4ff;font:16px/1.72 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre;overflow:auto;tab-size:2}.diagnostics{display:none;margin-top:12px;padding:15px;border:1px solid rgba(255,190,98,.23);border-radius:17px;background:rgba(112,70,20,.12)}.diagnostics.show{display:block}.diagnostics h3{margin:0 0 10px;font-size:13px;color:#ffd18a}.diagList{display:grid;gap:7px}.diagItem{display:flex;align-items:center;gap:10px;text-align:left;border:1px solid rgba(255,198,115,.14);border-radius:12px;background:rgba(255,188,85,.07);color:#f6dcb5;padding:9px 11px;font-size:12px}.diagItem strong{color:#ffca75;white-space:nowrap}.fixInfo{font-size:12px;color:#bdcde2;line-height:1.6;margin:9px 0 0}.previewPane{position:fixed;z-index:70;right:14px;top:80px;bottom:14px;width:min(640px,49vw);border:1px solid rgba(182,216,255,.24);border-radius:24px;background:#0b1b31;box-shadow:0 30px 90px rgba(0,0,0,.5);overflow:auto;display:none}.previewPane.show{display:block}.previewHead{position:sticky;top:0;display:flex;align-items:center;gap:8px;padding:10px 14px;background:rgba(8,22,42,.94);border-bottom:1px solid var(--edge);z-index:2}.previewInner{padding:25px;background:#f4f0e8;color:#252a32}.previewInner.markdown-body{background:#f4f0e8;color:#252a32;font-size:15px;line-height:1.7}.editStatus{font-size:12px;color:#98b1d3;margin-left:auto}.readerError{color:#ffbdc9;padding:20px;text-align:center}.toast{position:fixed;left:50%;bottom:25px;transform:translateX(-50%);z-index:120;padding:10px 16px;border-radius:14px;background:#153654;border:1px solid rgba(155,220,255,.35);color:white;display:none;font-size:13px}.toast.show{display:block}.hidden{display:none!important}
+@media(max-width:760px){.pageHead{padding:12px 14px}.headTitle{max-width:100%;margin-left:0;width:100%;order:3}.status{margin-left:auto}.main{padding:12px}.readerWrap{padding-top:4px}.readerCard{padding:24px 20px;border-radius:22px;min-height:60vh}.readerCard.markdown-body{font-size:16px}.fabTrigger{right:14px;bottom:14px}.fabPanel{right:14px;bottom:82px}.editArea{min-height:55vh}.editor{height:55vh;min-height:400px;padding:18px;font-size:14px}.editorUnderlay{font-size:14px}.underlayInner{left:18px;top:18px}.previewPane{left:8px;right:8px;top:60px;bottom:8px;width:auto}.pageHead .amosLogo{width:38px;height:38px}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition:none!important}}
+</style></head><body>
 ${authed ? `
-
-<div class="topbar">
-
-<button
-  class="secondary"
-  id="homeBtn"
->
-Home
-</button>
-
-<button
-  class="secondary"
-  id="switchBtn"
->
-Switch Mode
-</button>
-
-<button
-  class="secondary"
-  id="previewBtn"
->
-Preview
-</button>
-
-<button
-  class="primary"
-  id="saveBtn"
->
-Save
-</button>
-
-<div
-  id="saveStatus"
-  class="saveStatus"
->
-Ready
-</div>
-
-</div>
-
-<div
-  id="editorToolbar"
-  class="toolbar"
-  style="display:none"
->
-
-<button data-insert="# ">H1</button>
-<button data-insert="## ">H2</button>
-<button data-insert="### ">H3</button>
-
-<button data-wrap="**">Bold</button>
-<button data-wrap="*">Italic</button>
-<button data-wrap="  \`\`">Code</button>
-
-<button data-block="code">CodeBlock</button>
-<button data-block="quote">Quote</button>
-<button data-block="table">Table</button>
-<button data-block="link">Link</button>
-<button data-block="image">Image</button>
-<button data-block="list">List</button>
-<button data-block="task">Task</button>
-<button data-block="math">Math</button>
-
-</div>
-
-<div
-  id="readerWrap"
-  class="readerWrap"
->
-
-<div class="themeButtons">
-
-<button
-  class="secondary themeBtn"
-  data-bg="linen"
->
-Linen
-</button>
-
-<button
-  class="secondary themeBtn"
-  data-bg="#ffffff"
->
-White
-</button>
-
-<button
-  class="secondary themeBtn"
-  data-bg="#f4ecd8"
->
-Warm
-</button>
-
-<button
-  class="secondary themeBtn"
-  data-bg="#e5e7eb"
->
-Gray
-</button>
-
-</div>
-
-<div
-  id="readerCard"
-  class="readerCard markdown-body"
-></div>
-
-</div>
-
-<div
-  id="editorWrap"
-  style="display:none"
->
-
-<textarea
-  id="editor"
-  class="editor"
-></textarea>
-
-<div
-  id="preview"
-  class="preview"
->
-
-<div
-  id="previewInner"
-  class="previewInner markdown-body"
-></div>
-
-</div>
-
-</div>
-
-` : 'Please login'}
-
+<header class="pageHead">${logoMarkup()}<div class="brand"><strong>AMOS / READING STUDIO</strong><span>Read slowly. Think clearly.</span></div><div id="headTitle" class="headTitle">Your note</div><div id="editStatus" class="status">Ready</div></header>
+<main class="main"><div id="readerMode"><div class="readHeading"><strong id="noteHeading">Loading note…</strong><span>Reading mode</span></div><div class="readerWrap"><article id="readerCard" class="readerCard markdown-body" data-skin="linen" data-width="comfort" data-font="serif" data-fontsize="medium"></article></div></div>
+<div id="editorMode" class="editShell"><div class="workspaceNav"><button class="btn" id="editHomeBtn">← Workspace</button><button class="btn" id="editSwitchBtn">◉ Reading mode</button><span class="editStatus" id="editorStatus">Autosave ready</span></div><div class="editToolbar"><button class="btn" data-insert="# ">H1</button><button class="btn" data-insert="## ">H2</button><button class="btn" data-insert="### ">H3</button><button class="btn" data-wrap="**">Bold</button><button class="btn" data-wrap="*">Italic</button><button class="btn" data-wrap="&#96;">Inline code</button><button class="btn" data-block="code">Code block</button><button class="btn" data-block="quote">Quote</button><button class="btn" data-block="table">Table</button><button class="btn" data-block="link">Link</button><button class="btn" data-block="image">Image</button><button class="btn" data-block="list">List</button><button class="btn" data-block="task">Task</button><button class="btn" data-block="math">LaTeX</button><button class="btn" data-block="mermaid">Mermaid</button><button class="btn" id="previewBtn">▧ Preview</button><button class="btn primary" id="saveBtn">Save now</button></div>
+<div class="detectBar"><button class="btn primary" id="detectBtn">⚑ Detect formatting</button><button class="btn hidden" id="fixBtn">✦ Auto-fix safe issues</button><span id="detectHint" class="detectHint">Check copied Markdown for common syntax problems. Suspect lines will be highlighted.</span></div>
+<div class="editArea"><pre class="editorUnderlay" aria-hidden="true"><div id="underlayInner" class="underlayInner"></div></pre><textarea id="editor" class="editor" spellcheck="false" aria-label="Markdown editor"></textarea></div><section id="diagnostics" class="diagnostics"><h3>⚑ Formatting diagnostics</h3><div id="diagList" class="diagList"></div><p class="fixInfo">Choose an item to jump to that line. Auto-fix only adjusts common Markdown spacing and closes unclosed code/math fences; the original note is not changed until you apply a fix or save.</p></section></div></main>
+<button id="fabTrigger" class="fabTrigger" aria-label="Open reading tools" aria-expanded="false">☷</button><aside id="fabPanel" class="fabPanel"><h3>Workspace controls</h3><div class="fabActions"><button class="btn" id="panelHomeBtn">⌂ Home</button><button class="btn" id="panelSwitchBtn">✎ Edit / Read</button><button class="btn" id="panelPreviewBtn">▧ Preview</button><button class="btn primary" id="panelSaveBtn">✓ Save note</button></div><div class="settingGroup"><h3>Reading paper</h3><div class="optionRow"><button class="btn active" data-skin="linen">Linen</button><button class="btn" data-skin="white">White</button><button class="btn" data-skin="warm">Warm</button><button class="btn" data-skin="gray">Gray</button><button class="btn" data-skin="midnight">Midnight</button><button class="btn" data-skin="sage">Sage</button></div></div><div class="settingGroup"><h3>Reading width</h3><div class="optionRow"><button class="btn" data-width="compact">Compact</button><button class="btn active" data-width="comfort">Comfort</button><button class="btn" data-width="wide">Wide</button></div></div><div class="settingGroup"><h3>Typography</h3><div class="optionRow"><button class="btn active" data-font="serif">Editorial serif</button><button class="btn" data-font="sans">Modern sans</button></div><div class="optionRow" style="margin-top:8px"><button class="btn" data-fontsize="small">A−</button><button class="btn active" data-fontsize="medium">A</button><button class="btn" data-fontsize="large">A＋</button></div></div><div class="settingGroup"><h3>Workspace color</h3><div class="optionRow"><button class="btn" data-theme-pick="ocean">Ocean</button><button class="btn" data-theme-pick="rose">Rose</button><button class="btn" data-theme-pick="mint">Aurora</button><button class="btn" data-theme-pick="amber">Amber</button></div></div></aside>
+<div id="previewPane" class="previewPane"><div class="previewHead"><strong>Live preview</strong><span class="editStatus">Markdown · HTML · LaTeX · Mermaid</span><button class="btn" id="closePreviewBtn">Close</button></div><div id="previewInner" class="previewInner markdown-body"></div></div><div id="toast" class="toast" role="status"></div>` : '<main class="main"><section class="readerCard"><h2>Login required</h2><p>Please sign in to access your workspace.</p><a href="/">Return to login</a></section></main>'}
 <script>
-
-(async()=>{
-
-const authed=${authed?'true':'false'};
-
-if(!authed)return;
-
-// INITIALIZE KATEX EXTENSION
-if (window.markedKatex) {
-  marked.use(window.markedKatex({ throwOnError: false }));
-}
-
-const p = new URLSearchParams(location.search);
-
-const title = p.get('title');
-
-let mode = p.get('mode') || 'read';
-
-const readerCard =
-  document.getElementById('readerCard');
-
-const editor =
-  document.getElementById('editor');
-
-const preview =
-  document.getElementById('preview');
-
-const previewInner =
-  document.getElementById('previewInner');
-
-const saveStatus =
-  document.getElementById('saveStatus');
-
-const readerWrap =
-  document.getElementById('readerWrap');
-
-const editorWrap =
-  document.getElementById('editorWrap');
-
-const toolbar =
-  document.getElementById('editorToolbar');
-
-let previewOpen=false;
-
-/* COPY BUTTON */
-
-function addCopyButtons(container){
-
-  const pres =
-    container.querySelectorAll('pre');
-
-  pres.forEach(pre=>{
-
-    if(pre.querySelector('.copy-btn')){
-      return;
-    }
-
-    const btn =
-      document.createElement('button');
-
-    btn.className='copy-btn';
-
-    btn.innerText='Copy';
-
-    btn.onclick=async()=>{
-
-      const code =
-        pre.querySelector('code');
-
-      const text =
-        code
-          ? code.innerText
-          : pre.innerText;
-
-      await navigator.clipboard.writeText(text);
-
-      btn.innerText='Copied';
-
-      setTimeout(()=>{
-        btn.innerText='Copy';
-      },2000);
-    };
-
-    pre.appendChild(btn);
-  });
-}
-
-/* LOAD */
-
-async function load(){
-
-  const r = await fetch(
-    '/api/doc/'+encodeURIComponent(title)
-  );
-
-  const j = await r.json();
-
-  const content = j.content || '';
-
-  readerCard.innerHTML =
-    marked.parse(content);
-
-  editor.value = content;
-
-  renderPreview();
-
-  addCopyButtons(readerCard);
-
-  applyMode();
-}
-
-/* MODE */
-
-function applyMode(){
-
-  if(mode==='read'){
-
-    readerWrap.style.display='block';
-
-    editorWrap.style.display='none';
-
-    toolbar.style.display='none';
-
-  }else{
-
-    readerWrap.style.display='none';
-
-    editorWrap.style.display='block';
-
-    toolbar.style.display='flex';
-  }
-}
-
-/* PREVIEW */
-
-function renderPreview(){
-
-  previewInner.innerHTML =
-    marked.parse(editor.value);
-
-  addCopyButtons(previewInner);
-}
-
-/* SAVE */
-
-async function save(){
-
-  saveStatus.innerText='Saving...';
-
-  await fetch(
-    '/api/doc/'+encodeURIComponent(title),
-    {
-      method:'PUT',
-      headers:{
-        'Content-Type':'application/json'
-      },
-      body:JSON.stringify({
-        content:editor.value
-      })
-    }
-  );
-
-  readerCard.innerHTML =
-    marked.parse(editor.value);
-
-  addCopyButtons(readerCard);
-
-  saveStatus.innerText='Saved ✓';
-
-  setTimeout(()=>{
-    saveStatus.innerText='Ready';
-  },2500);
-}
-
-/* AUTOSAVE */
-
-let timer=null;
-
-editor.addEventListener('input',()=>{
-
-  saveStatus.innerText='Typing...';
-
-  renderPreview();
-
-  clearTimeout(timer);
-
-  timer=setTimeout(async()=>{
-    await save();
-  },2500);
-});
-
-/* INSERT HELPERS */
-
-function insertText(text){
-
-  const start = editor.selectionStart;
-
-  editor.setRangeText(
-    text,
-    start,
-    start,
-    'end'
-  );
-
-  editor.focus();
-}
-
-function wrapSelection(before,after){
-
-  const start = editor.selectionStart;
-
-  const end = editor.selectionEnd;
-
-  const selected =
-    editor.value.substring(start,end);
-
-  editor.setRangeText(
-    before + selected + after,
-    start,
-    end,
-    'end'
-  );
-
-  editor.focus();
-
-  renderPreview();
-}
-
-function insertBlock(text){
-
-  const start = editor.selectionStart;
-
-  editor.setRangeText(
-    "\\n"+text+"\\n",
-    start,
-    start,
-    'end'
-  );
-
-  editor.focus();
-
-  renderPreview();
-}
-
-/* TOOLBAR BUTTONS */
-
-document
-.querySelectorAll('[data-insert]')
-.forEach(btn=>{
-
-  btn.onclick=()=>{
-
-    insertText(btn.dataset.insert);
-  };
-});
-
-document
-.querySelectorAll('[data-wrap]')
-.forEach(btn=>{
-
-  btn.onclick=()=>{
-
-    const w = btn.dataset.wrap;
-
-    wrapSelection(w,w);
-  };
-});
-
-document
-.querySelectorAll('[data-block]')
-.forEach(btn=>{
-
-  btn.onclick=()=>{
-
-    const type = btn.dataset.block;
-
-    if(type==='code'){
-
-      insertBlock(
-'\`\`\`  \\n\\n\\n\`\`\`'
-      );
-    }
-
-    if(type==='quote'){
-
-      insertBlock(
-'>    '
-      );
-    }
-
-    if(type==='table'){
-
-      insertBlock(
-'| Title | Value |\\n|---|---|\\n| A | B |'
-      );
-    }
-
-    if(type==='link'){
-
-      insertBlock(
-'[OpenAI](https://openai.com)'
-      );
-    }
-
-    if(type==='image'){
-
-      insertBlock(
-'![image](https://example.com/image.jpg)'
-      );
-    }
-
-    if(type==='list'){
-
-      insertBlock(
-'- item 1\\n- item 2\\n- item 3'
-      );
-    }
-
-    if(type==='task'){
-
-      insertBlock(
-'- [ ] task 1\\n- [x] task 2'
-      );
-    }
-
-    if(type==='math'){
-
-      insertBlock(
-'$$\\nE = mc^2\\n$$'
-      );
-    }
-  };
-});
-
-/* THEMES */
-
-document
-.querySelectorAll('.themeBtn')
-.forEach(btn=>{
-
-  btn.onclick=()=>{
-
-    readerCard.style.background =
-      btn.dataset.bg;
-  };
-});
-
-/* BUTTONS */
-
-document.getElementById('saveBtn').onclick=save;
-
-document.getElementById('switchBtn').onclick=()=>{
-
-  mode =
-    mode==='read'
-      ? 'edit'
-      : 'read';
-
-  applyMode();
-};
-
-document.getElementById('previewBtn').onclick=()=>{
-
-  previewOpen=!previewOpen;
-
-  if(previewOpen){
-
-    preview.classList.add('show');
-
-  }else{
-
-    preview.classList.remove('show');
-  }
-};
-
-document.getElementById('homeBtn').onclick=()=>{
-
-  location.href='/';
-};
-
-/* SHORTCUTS */
-
-editor.addEventListener('keydown',e=>{
-
-  if(e.ctrlKey && e.key==='s'){
-
-    e.preventDefault();
-
-    save();
-  }
-
-  if(e.key==='Tab'){
-
-    e.preventDefault();
-
-    const start=editor.selectionStart;
-
-    editor.setRangeText(
-      '  ',
-      start,
-      start,
-      'end'
-    );
-  }
-});
-
-await load();
-
+(async function(){'use strict';const authed=${authed ? 'true' : 'false'};if(!authed)return;
+const params=new URLSearchParams(location.search),title=params.get('title')||'',initialMode=params.get('mode')||'read';let mode=initialMode==='edit'?'edit':'read',timer=null,dirty=false,lastDiagnostics=[],savedContent='';const readerMode=document.getElementById('readerMode'),editorMode=document.getElementById('editorMode'),readerCard=document.getElementById('readerCard'),editor=document.getElementById('editor'),underlayInner=document.getElementById('underlayInner'),diagnostics=document.getElementById('diagnostics'),diagList=document.getElementById('diagList'),fixBtn=document.getElementById('fixBtn'),detectHint=document.getElementById('detectHint'),previewPane=document.getElementById('previewPane'),previewInner=document.getElementById('previewInner'),fabPanel=document.getElementById('fabPanel'),fabTrigger=document.getElementById('fabTrigger'),editStatus=document.getElementById('editStatus'),headTitle=document.getElementById('headTitle'),noteHeading=document.getElementById('noteHeading');headTitle.textContent=title||'Untitled note';noteHeading.textContent=title||'Untitled note';document.title=(title?title+' · ':'')+'Amos Reading Studio';
+function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._timer);t._timer=setTimeout(function(){t.classList.remove('show')},2200)}
+function setStatus(msg){editStatus.textContent=msg;if(editorStatus)editorStatus.textContent=msg}
+function escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+function initMarkdown(){if(!window.marked)return;try{marked.setOptions({gfm:true,breaks:false,async:false});marked.use({renderer:{code:function(info){const lang=(info.lang||'').trim().split(/\s+/)[0].toLowerCase();if(lang==='mermaid')return '<div class="mermaid">'+escapeHtml(info.text)+'</div>';return false}}});if(window.markedKatex){marked.use(window.markedKatex({throwOnError:false,output:'htmlAndMathml'}))}}catch(e){console.warn('Markdown extension initialisation:',e)}if(window.mermaid){try{mermaid.initialize({startOnLoad:false,securityLevel:'strict',theme:'neutral',flowchart:{htmlLabels:false},sequence:{useMaxWidth:true}})}catch(e){console.warn(e)}}}
+function sanitizeRenderedHTML(html){if(window.DOMPurify)return DOMPurify.sanitize(html,{USE_PROFILES:{html:true},ADD_ATTR:['class','style','target','rel','aria-label','align','valign','colspan','rowspan']});try{const parsed=new DOMParser().parseFromString(html,'text/html');parsed.querySelectorAll('script,iframe,object,embed,base,meta,link,form,style,svg,math').forEach(function(n){n.remove()});parsed.querySelectorAll('*').forEach(function(node){Array.from(node.attributes).forEach(function(attr){const name=attr.name.toLowerCase(),value=attr.value.trim();if(name.startsWith('on')||name==='srcdoc'||name==='formaction'||name==='style'){node.removeAttribute(attr.name);return}if(['href','src','xlink:href'].indexOf(name)>=0&&/^(?:javascript|vbscript|data):/i.test(value))node.removeAttribute(attr.name)})});return parsed.body.innerHTML}catch(e){return '<pre>'+escapeHtml(html)+'</pre>'}}function parseMarkdown(source){try{if(!window.marked)return '<pre>'+escapeHtml(source)+'</pre>';return sanitizeRenderedHTML(marked.parse(source||''))}catch(e){return '<pre>'+escapeHtml(source)+'</pre><p class="raw-html-note">Preview encountered a formatting issue; raw text is shown above.</p>'}}
+async function enhanceRendered(container){container.querySelectorAll('pre').forEach(function(pre){if(pre.querySelector('.copy-btn'))return;const b=document.createElement('button');b.className='copy-btn';b.type='button';b.textContent='Copy';b.addEventListener('click',async function(){const code=pre.querySelector('code');try{await navigator.clipboard.writeText(code?code.innerText:pre.innerText);b.textContent='Copied';setTimeout(function(){b.textContent='Copy'},1500)}catch(e){toast('Clipboard access is not available in this context.')}});pre.appendChild(b)});if(window.mermaid){const nodes=container.querySelectorAll('.mermaid:not([data-processed="true"])');if(nodes.length){try{await mermaid.run({nodes:Array.from(nodes)})}catch(e){console.warn('Mermaid rendering failed:',e);nodes.forEach(function(n){n.setAttribute('data-render-error','true')})}}}}
+async function renderTo(source,target){target.innerHTML=parseMarkdown(source);await enhanceRendered(target)}
+async function load(){if(!title){readerCard.innerHTML='<p class="readerError">No note title was provided. Return to your workspace and open a note.</p>';return}try{const r=await fetch('/api/doc/'+encodeURIComponent(title));const j=await r.json();if(!r.ok)throw new Error(j.error||'Could not load note');const content=j.content||'';savedContent=content;editor.value=content;await renderTo(content,readerCard);await renderTo(content,previewInner);applyMode();setStatus('Ready')}catch(e){readerCard.innerHTML='<p class="readerError">Unable to load this note: '+escapeHtml(e.message)+'</p>'}}
+function applyMode(){const isRead=mode==='read';readerMode.classList.toggle('hidden',!isRead);editorMode.style.display=isRead?'none':'block';if(!isRead){refreshHighlights();renderPreview();setStatus(dirty?'Unsaved changes':'Autosave ready')}document.getElementById('panelSwitchBtn').textContent=isRead?'✎ Edit note':'◉ Reading mode';document.getElementById('editSwitchBtn').textContent=isRead?'✎ Edit note':'◉ Reading mode';fabTrigger.setAttribute('aria-label',isRead?'Open reading tools':'Open note tools')}
+function applyPrefs(){let prefs={};try{prefs=JSON.parse(localStorage.getItem('amos-reader-prefs')||'{}')}catch(e){}['skin','width','font','fontsize'].forEach(function(k){const allowed={skin:['linen','white','warm','gray','midnight','sage'],width:['compact','comfort','wide'],font:['serif','sans'],fontsize:['small','medium','large']}[k];if(allowed.indexOf(prefs[k])>=0)readerCard.dataset[k]=prefs[k]});syncPrefButtons()}
+function syncPrefButtons(){['skin','width','font','fontsize'].forEach(function(k){document.querySelectorAll('button[data-'+k+']').forEach(function(b){b.classList.toggle('active',b.dataset[k]===readerCard.dataset[k])})})}
+function savePrefs(){try{localStorage.setItem('amos-reader-prefs',JSON.stringify({skin:readerCard.dataset.skin,width:readerCard.dataset.width,font:readerCard.dataset.font,fontsize:readerCard.dataset.fontsize}))}catch(e){}}
+function pickTheme(theme){if(['ocean','rose','mint','amber'].indexOf(theme)<0)theme='ocean';document.documentElement.setAttribute('data-theme',theme==='ocean'?'':theme);try{localStorage.setItem('amos-theme',theme)}catch(e){}document.querySelectorAll('[data-theme-pick]').forEach(function(b){b.classList.toggle('active',b.dataset.themePick===theme)})}
+try{pickTheme(localStorage.getItem('amos-theme')||'ocean')}catch(e){pickTheme('ocean')}applyPrefs();
+function setPref(kind,value){readerCard.dataset[kind]=value;savePrefs();syncPrefButtons()}
+document.querySelectorAll('[data-skin]').forEach(function(b){b.addEventListener('click',function(){setPref('skin',b.dataset.skin)})});document.querySelectorAll('[data-width]').forEach(function(b){b.addEventListener('click',function(){setPref('width',b.dataset.width)})});document.querySelectorAll('[data-font]').forEach(function(b){b.addEventListener('click',function(){setPref('font',b.dataset.font)})});document.querySelectorAll('[data-fontsize]').forEach(function(b){b.addEventListener('click',function(){setPref('fontsize',b.dataset.fontsize)})});document.querySelectorAll('[data-theme-pick]').forEach(function(b){b.addEventListener('click',function(){pickTheme(b.dataset.themePick)})});
+function setMode(next){const requested=next==='edit'?'edit':'read';if(requested==='read'&&mode==='edit'&&dirty){save().then(function(ok){if(ok){mode='read';applyMode()} });return}mode=requested;applyMode();if(mode==='edit')editor.focus();window.scrollTo({top:0,behavior:'smooth'})}
+function save(){clearTimeout(timer);setStatus('Saving…');return fetch('/api/doc/'+encodeURIComponent(title),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:editor.value})}).then(async function(r){const j=await r.json();if(!r.ok)throw new Error(j.error||'Save failed');savedContent=editor.value;dirty=false;setStatus('Saved ✓');await renderTo(editor.value,readerCard);await renderTo(editor.value,previewInner);return true}).catch(function(e){setStatus('Save failed');toast(e.message);return false})}
+function scheduleSave(){dirty=true;setStatus('Typing · autosaving…');clearTimeout(timer);timer=setTimeout(function(){save()},1600)}
+function renderPreview(){renderTo(editor.value,previewInner)}
+function escLine(s){return escapeHtml(s===''?'\u200b':s)}
+function refreshHighlights(){if(!underlayInner)return;const text=editor.value;const issues=new Set(lastDiagnostics.map(function(d){return d.line}));const lines=text.split('\n');underlayInner.innerHTML=lines.map(function(line,i){return '<span class="underlayLine'+(issues.has(i+1)?' issue':'')+'">'+escLine(line)+'</span>'}).join('');underlayInner.style.transform='translate('+(-editor.scrollLeft)+'px,'+(-editor.scrollTop)+'px)'}
+editor.addEventListener('scroll',function(){underlayInner.style.transform='translate('+(-editor.scrollLeft)+'px,'+(-editor.scrollTop)+'px)' });
+function analyzeMarkdown(text){const lines=text.split('\n'),out=[];let fence=null,fenceStart=0,mathCount=0;function add(line,msg,fixable,kind){out.push({line:line,message:msg,fixable:!!fixable,kind:kind||'syntax'})}for(let i=0;i<lines.length;i++){const line=lines[i],n=i+1;const fenceMark=line.match(/^\s*(\x60{3,}|~~~+)/);if(fenceMark){const marker=fenceMark[1];if(!fence){fence={char:marker[0],length:marker.length};fenceStart=n}else if(marker[0]===fence.char&&marker.length>=fence.length){fence=null}continue}if(fence)continue;if(/^\s*#{1,6}\S/.test(line))add(n,'Heading marker is missing a space after #.',true,'heading');if(/^\s*[-*+]\S/.test(line))add(n,'List marker should be followed by a space.',true,'list');if(/^\s*\d+\.\S/.test(line))add(n,'Ordered-list marker should be followed by a space.',true,'numbered');const ticks=line.split(String.fromCharCode(96)).length-1;if(ticks%2)add(n,'Inline-code backtick may be unclosed.',true,'inline-code');const dollars=(line.match(/\$\$/g)||[]).length;if(dollars%2===1)mathCount++;}
+if(fence)add(fenceStart,'Code fence opened here but not closed.',true,'fence');if(mathCount%2)add(lines.length,'Math block may be missing a closing $$ delimiter.',true,'math');return out}
+function showDiagnostics(list){lastDiagnostics=list;refreshHighlights();diagList.textContent='';diagnostics.classList.add('show');fixBtn.classList.toggle('hidden',!list.some(function(d){return d.fixable}));detectHint.textContent=list.length?'Found '+list.length+' possible formatting issue(s). Click a row to inspect it.':'No common Markdown format issues detected.';if(!list.length){const p=document.createElement('p');p.className='fixInfo';p.textContent='No common issues were detected. Some formatting problems depend on the original source or Markdown dialect and may not be caught automatically.';diagList.appendChild(p);return}list.forEach(function(d){const b=document.createElement('button');b.type='button';b.className='diagItem';const strong=document.createElement('strong');strong.textContent='Line '+d.line;b.appendChild(strong);const span=document.createElement('span');span.textContent=d.message;b.appendChild(span);b.addEventListener('click',function(){const line=Math.max(1,Math.min(d.line,editor.value.split('\n').length));const before=editor.value.split('\n').slice(0,line-1).join('\n');editor.focus();editor.setSelectionRange(before.length+(line>1?1:0),before.length+(line>1?1:0));const lineHeight=Number.parseFloat(getComputedStyle(editor).lineHeight)||24;editor.scrollTop=Math.max(0,(line-1)*lineHeight-100);underlayInner.style.transform='translate('+(-editor.scrollLeft)+'px,'+(-editor.scrollTop)+'px)'});diagList.appendChild(b)})}
+function fixCommon(text){let lines=text.split('\n'),fence=null,mathDelimiters=0;lines=lines.map(function(line){const mark=line.match(/^\s*(\x60{3,}|~~~+)/);if(mark){const marker=mark[1];if(!fence)fence={char:marker[0],length:marker.length};else if(marker[0]===fence.char&&marker.length>=fence.length)fence=null;return line}if(fence)return line;line=line.replace(/^(\s*#{1,6})(\S)/,'$1 $2');line=line.replace(/^(\s*[-*+])(\S)/,'$1 $2');line=line.replace(/^(\s*\d+\.)(\S)/,'$1 $2');const ticks=line.split(String.fromCharCode(96)).length-1;if(ticks%2)line+=String.fromCharCode(96);mathDelimiters+=(line.match(/\$\$/g)||[]).length;return line});if(fence)lines.push(fence.char.repeat(fence.length));if(mathDelimiters%2)lines.push('$$');return lines.join('\n')}
+document.getElementById('detectBtn').addEventListener('click',function(){showDiagnostics(analyzeMarkdown(editor.value));toast('Formatting scan complete')});fixBtn.addEventListener('click',function(){const fixed=fixCommon(editor.value);if(fixed===editor.value){toast('No safe automatic changes to apply');return}if(!confirm('Apply safe spacing fixes and close likely unclosed Markdown/LaTeX delimiters? Your change will be visible in the editor and will autosave.'))return;editor.value=fixed;lastDiagnostics=[];showDiagnostics(analyzeMarkdown(editor.value));scheduleSave();renderPreview();toast('Safe formatting fixes applied')});
+function insertAtCursor(text){const start=editor.selectionStart,end=editor.selectionEnd;editor.setRangeText(text,start,end,'end');editor.focus();editor.dispatchEvent(new Event('input',{bubbles:true}))}function wrapSelection(before,after){const start=editor.selectionStart,end=editor.selectionEnd,selected=editor.value.slice(start,end);editor.setRangeText(before+selected+after,start,end,'end');editor.focus();editor.dispatchEvent(new Event('input',{bubbles:true}))}function insertBlock(text){insertAtCursor('\n'+text+'\n')}
+document.querySelectorAll('[data-insert]').forEach(function(b){b.addEventListener('click',function(){insertAtCursor(b.dataset.insert)})});document.querySelectorAll('[data-wrap]').forEach(function(b){b.addEventListener('click',function(){wrapSelection(b.dataset.wrap,b.dataset.wrap)})});document.querySelectorAll('[data-block]').forEach(function(b){b.addEventListener('click',function(){const type=b.dataset.block;const fence=String.fromCharCode(96).repeat(3);const examples={code:fence+'javascript\n// write code here\n'+fence,quote:'> A thoughtful quote',table:'| Column | Value |\n| --- | --- |\n| Item | Detail |',link:'[Link title](https://example.com)',image:'![Image description](https://example.com/image.png)',list:'- First item\n- Second item\n- Third item',task:'- [ ] Todo\n- [x] Done',math:'$$\nE = mc^2\n$$',mermaid:fence+'mermaid\nflowchart TD\n  A[Idea] --> B[Action]\n  B --> C[Result]\n'+fence};insertBlock(examples[type]||'')})});
+editor.addEventListener('input',function(){refreshHighlights();renderPreview();scheduleSave()});document.getElementById('saveBtn').addEventListener('click',save);document.getElementById('editSwitchBtn').addEventListener('click',function(){setMode('read')});document.getElementById('panelSwitchBtn').addEventListener('click',function(){setMode(mode==='read'?'edit':'read');fabPanel.classList.remove('open');fabTrigger.setAttribute('aria-expanded','false')});document.getElementById('panelHomeBtn').addEventListener('click',function(){location.href='/'});document.getElementById('editHomeBtn').addEventListener('click',function(){if(dirty)save().then(function(ok){if(ok)location.href='/';else if(confirm('The note could not be saved. Leave this page anyway? Unsaved changes may be lost.'))location.href='/'});else location.href='/'});document.getElementById('panelSaveBtn').addEventListener('click',save);document.getElementById('previewBtn').addEventListener('click',function(){previewPane.classList.toggle('show');renderPreview()});document.getElementById('panelPreviewBtn').addEventListener('click',function(){previewPane.classList.toggle('show');renderPreview()});document.getElementById('closePreviewBtn').addEventListener('click',function(){previewPane.classList.remove('show')});fabTrigger.addEventListener('click',function(){const open=fabPanel.classList.toggle('open');fabTrigger.setAttribute('aria-expanded',String(open))});document.addEventListener('keydown',function(e){if(e.key==='Escape'){fabPanel.classList.remove('open');fabTrigger.setAttribute('aria-expanded','false');previewPane.classList.remove('show')}if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='s'){e.preventDefault();save()}if(e.key==='Tab'&&document.activeElement===editor){e.preventDefault();insertAtCursor('  ')}});window.addEventListener('beforeunload',function(e){if(dirty){e.preventDefault();e.returnValue=''}});
+initMarkdown();await load();if(mode==='edit')applyMode();
 })();
-</script>
-
-</body>
-</html>
-`;
+</script></body></html>`;
 }
